@@ -19,18 +19,17 @@ docker run -d --name xournalpp \
   -v /dev/input:/dev/input \
   --device-cgroup-rule 'c 13:* rmw' \
   -v xournalpp-data:/data \
-  -e WEYLUS_ACCESS_CODE=change-me \
   -p 127.0.0.1:1701:1701 \
   ghcr.io/advaypakhale/xournalpp-web:latest
 ```
 
-Open `http://<host>:1701`, enter the access code, tick "uinput" and "stylus
-input", then connect. Chromium reports pen pressure from Wacom devices on
-Linux; Firefox has not always.
+Open `http://<host>:1701`, tick "uinput" and "stylus input", then connect.
+Chromium reports pen pressure from Wacom devices on Linux; Firefox has not
+always.
 
 | variable | default | |
 |---|---|---|
-| `WEYLUS_ACCESS_CODE` | required | login for the page |
+| `WEYLUS_ACCESS_CODE` | unset | if set, the page asks for it before connecting |
 | `SCREEN` | `1920x1080` | size of the virtual screen |
 | `XOURNALPP_FILE` | unset | file under `/data/notes` to open at start |
 

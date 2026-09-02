@@ -3,7 +3,6 @@
 # without udev Xorg only picks up the devices named in its config.
 set -euo pipefail
 
-: "${WEYLUS_ACCESS_CODE:?set WEYLUS_ACCESS_CODE}"
 WIDTH=${SCREEN%x*}
 HEIGHT=${SCREEN#*x}
 
@@ -17,7 +16,7 @@ cleanup() {
 trap cleanup TERM INT
 
 weylus --no-gui --precreate-uinput --bind-address 0.0.0.0 --web-port 1701 \
-    --access-code "$WEYLUS_ACCESS_CODE" &
+    ${WEYLUS_ACCESS_CODE:+--access-code "$WEYLUS_ACCESS_CODE"} &
 
 event_node() {
     local dev
