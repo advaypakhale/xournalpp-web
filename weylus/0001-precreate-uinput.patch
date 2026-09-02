@@ -1,0 +1,231 @@
+diff --git a/src/config.rs b/src/config.rs
+index 6b2a717..27922e8 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -113,6 +113,14 @@ pub struct Config {
+     #[arg(long, help = "Wayland/PipeWire Support.")]
+     #[serde(default)]
+     pub wayland_support: bool,
++    #[cfg(target_os = "linux")]
++    #[arg(
++        long,
++        help = "Create the uinput devices at startup and share them between clients instead of \
++                creating one set per client. Lets an X server without udev hotplug see them."
++    )]
++    #[serde(default)]
++    pub precreate_uinput: bool,
+ 
+     #[arg(long, help = "Print template of index.html served by Weylus.")]
+     #[serde(skip)]
+diff --git a/src/input/uinput_device.rs b/src/input/uinput_device.rs
+index 80e8023..d849b4a 100644
+--- a/src/input/uinput_device.rs
++++ b/src/input/uinput_device.rs
+@@ -1,6 +1,7 @@
+ use std::cmp::Ordering;
+ use std::ffi::CString;
+ use std::os::raw::{c_char, c_int};
++use std::sync::{Arc, Mutex};
+ use std::time::{Duration, Instant};
+ 
+ use crate::capturable::x11::X11Context;
+@@ -37,7 +38,7 @@ pub struct UInputDevice {
+     tool_pen_active: bool,
+     pen_touching: bool,
+     last_pen_event: Instant,
+-    capturable: Box<dyn Capturable>,
++    capturable: Option<Box<dyn Capturable>>,
+     geometry: Rect,
+     name_mouse_device: String,
+     name_stylus_device: String,
+@@ -49,7 +50,10 @@ pub struct UInputDevice {
+ }
+ 
+ impl UInputDevice {
+-    pub fn new(capturable: Box<dyn Capturable>, id: &Option<String>) -> Result<Self, CError> {
++    pub fn new(
++        capturable: Option<Box<dyn Capturable>>,
++        id: &Option<String>,
++    ) -> Result<Self, CError> {
+         let mut suffix = String::new();
+         if let Some(id) = id {
+             suffix = format!(" - {}", id);
+@@ -238,7 +242,11 @@ const MAX_SCREEN_MAPPING_TRIES: usize = 100;
+ 
+ impl InputDevice for UInputDevice {
+     fn send_wheel_event(&mut self, event: &WheelEvent) {
+-        if let Err(err) = self.capturable.before_input() {
++        let Some(capturable) = self.capturable.as_mut() else {
++            warn!("No capturable selected, sending no input");
++            return;
++        };
++        if let Err(err) = capturable.before_input() {
+             warn!("Failed to activate window, sending no input ({})", err);
+             return;
+         }
+@@ -276,11 +284,19 @@ impl InputDevice for UInputDevice {
+     }
+ 
+     fn send_pointer_event(&mut self, event: &PointerEvent) {
+-        if let Err(err) = self.capturable.before_input() {
++        let Some(capturable) = self.capturable.as_mut() else {
++            warn!("No capturable selected, sending no input");
++            return;
++        };
++        if let Err(err) = capturable.before_input() {
+             warn!("Failed to activate window, sending no input ({})", err);
+             return;
+         }
+-        let (x, y, width, height) = match self.capturable.geometry().unwrap() {
++        // A precreated device may predate the X server.
++        if self.x11ctx.is_none() {
++            self.x11ctx = X11Context::new();
++        }
++        let (x, y, width, height) = match capturable.geometry().unwrap() {
+             Geometry::Relative(x, y, width, height) => (x, y, width, height),
+         };
+         self.geometry.x = x;
+@@ -642,7 +658,11 @@ impl InputDevice for UInputDevice {
+ 
+     fn send_keyboard_event(&mut self, event: &KeyboardEvent) {
+         use crate::input::uinput_keys::*;
+-        if let Err(err) = self.capturable.before_input() {
++        let Some(capturable) = self.capturable.as_mut() else {
++            warn!("No capturable selected, sending no input");
++            return;
++        };
++        if let Err(err) = capturable.before_input() {
+             warn!("Failed to activate window, sending no input ({})", err);
+             return;
+         }
+@@ -907,7 +927,36 @@ impl InputDevice for UInputDevice {
+     }
+ 
+     fn set_capturable(&mut self, capturable: Box<dyn Capturable>) {
+-        self.capturable = capturable;
++        self.capturable = Some(capturable);
++    }
++
++    fn device_type(&self) -> InputDeviceType {
++        InputDeviceType::UInputDevice
++    }
++}
++
++// The X display and capturable inside are only ever used by the thread holding the mutex in
++// SharedUInputDevice, which is what makes moving them between threads sound.
++unsafe impl Send for UInputDevice {}
++
++/// One set of uinput devices used by every client, created before any client connects.
++pub struct SharedUInputDevice(pub Arc<Mutex<UInputDevice>>);
++
++impl InputDevice for SharedUInputDevice {
++    fn send_wheel_event(&mut self, event: &WheelEvent) {
++        self.0.lock().unwrap().send_wheel_event(event)
++    }
++
++    fn send_pointer_event(&mut self, event: &PointerEvent) {
++        self.0.lock().unwrap().send_pointer_event(event)
++    }
++
++    fn send_keyboard_event(&mut self, event: &KeyboardEvent) {
++        self.0.lock().unwrap().send_keyboard_event(event)
++    }
++
++    fn set_capturable(&mut self, capturable: Box<dyn Capturable>) {
++        self.0.lock().unwrap().set_capturable(capturable)
+     }
+ 
+     fn device_type(&self) -> InputDeviceType {
+diff --git a/src/websocket.rs b/src/websocket.rs
+index 4cfb2f5..e302276 100644
+--- a/src/websocket.rs
++++ b/src/websocket.rs
+@@ -3,7 +3,7 @@ use hyper::upgrade::Upgraded;
+ use hyper_util::rt::TokioIo;
+ use std::convert::Infallible;
+ use std::sync::mpsc::RecvTimeoutError;
+-use std::sync::{mpsc, Arc};
++use std::sync::{mpsc, Arc, Mutex};
+ use std::thread::{spawn, JoinHandle};
+ use std::time::{Duration, Instant};
+ use tokio::sync::mpsc::channel;
+@@ -57,11 +57,13 @@ pub struct WeylusClientHandler<S, R, FnUInput> {
+     video_thread: JoinHandle<()>,
+ }
+ 
+-#[derive(Clone, Copy)]
++#[derive(Clone)]
+ pub struct WeylusClientConfig {
+     pub encoder_options: EncoderOptions,
+     #[cfg(target_os = "linux")]
+     pub wayland_support: bool,
++    #[cfg(target_os = "linux")]
++    pub shared_uinput: Option<Arc<Mutex<crate::input::uinput_device::UInputDevice>>>,
+     pub no_gui: bool,
+ }
+ 
+@@ -228,11 +230,22 @@ impl<S, R, FnUInput> WeylusClientHandler<S, R, FnUInput> {
+ 
+             #[cfg(target_os = "linux")]
+             if config.uinput_support {
+-                if self.input_device.as_ref().map_or(true, |d| {
++                if let Some(shared) = &self.config.shared_uinput {
++                    if self.input_device.as_ref().map_or(true, |d| {
++                        d.device_type() != InputDeviceType::UInputDevice
++                    }) {
++                        self.input_device = Some(Box::new(
++                            crate::input::uinput_device::SharedUInputDevice(shared.clone()),
++                        ));
++                    }
++                    if let Some(d) = self.input_device.as_mut() {
++                        d.set_capturable(capturable.clone());
++                    }
++                } else if self.input_device.as_ref().map_or(true, |d| {
+                     client_name_changed || d.device_type() != InputDeviceType::UInputDevice
+                 }) {
+                     let device = crate::input::uinput_device::UInputDevice::new(
+-                        capturable.clone(),
++                        Some(capturable.clone()),
+                         &self.client_name,
+                     );
+                     match device {
+diff --git a/src/weylus.rs b/src/weylus.rs
+index 8d2c812..c230f57 100644
+--- a/src/weylus.rs
++++ b/src/weylus.rs
+@@ -1,5 +1,5 @@
+ use std::net::SocketAddr;
+-use std::sync::Arc;
++use std::sync::{Arc, Mutex};
+ use tracing::error;
+ 
+ use crate::config::Config;
+@@ -47,6 +47,19 @@ impl Weylus {
+             try_mediafoundation: false,
+         };
+ 
++        #[cfg(target_os = "linux")]
++        let shared_uinput = if config.precreate_uinput {
++            match crate::input::uinput_device::UInputDevice::new(None, &None) {
++                Ok(device) => Some(Arc::new(Mutex::new(device))),
++                Err(err) => {
++                    error!("Failed to create uinput devices: {}", err);
++                    return false;
++                }
++            }
++        } else {
++            None
++        };
++
+         let (sender_ui, mut receiver_ui) = tokio::sync::mpsc::channel(100);
+         let (sender_startup, receiver_startup) = tokio::sync::oneshot::channel();
+ 
+@@ -70,6 +83,8 @@ impl Weylus {
+                 encoder_options,
+                 #[cfg(target_os = "linux")]
+                 wayland_support: config.wayland_support,
++                #[cfg(target_os = "linux")]
++                shared_uinput,
+                 no_gui: config.no_gui,
+             },
+         );

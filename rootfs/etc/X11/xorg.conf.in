@@ -1,0 +1,69 @@
+Section "ServerFlags"
+    Option "AutoAddDevices" "false"
+    Option "AutoEnableDevices" "false"
+    Option "DontVTSwitch" "true"
+    Option "BlankTime" "0"
+    Option "StandbyTime" "0"
+    Option "SuspendTime" "0"
+    Option "OffTime" "0"
+EndSection
+
+Section "Device"
+    Identifier "dummy"
+    Driver "dummy"
+    VideoRam 256000
+EndSection
+
+Section "Monitor"
+    Identifier "monitor"
+    HorizSync 5.0-1000.0
+    VertRefresh 5.0-200.0
+    @MODELINE@
+EndSection
+
+Section "Screen"
+    Identifier "screen"
+    Device "dummy"
+    Monitor "monitor"
+    DefaultDepth 24
+    SubSection "Display"
+        Depth 24
+        Modes "@MODE@"
+        Virtual @WIDTH@ @HEIGHT@
+    EndSubSection
+EndSection
+
+# evdev rather than libinput: libinput only accepts devices carrying udev's
+# ID_INPUT_* properties, and no udevd runs in the container.
+Section "InputDevice"
+    Identifier "stylus"
+    Driver "evdev"
+    Option "Device" "@STYLUS@"
+EndSection
+
+Section "InputDevice"
+    Identifier "mouse"
+    Driver "evdev"
+    Option "Device" "@MOUSE@"
+EndSection
+
+Section "InputDevice"
+    Identifier "touch"
+    Driver "evdev"
+    Option "Device" "@TOUCH@"
+EndSection
+
+Section "InputDevice"
+    Identifier "keyboard"
+    Driver "evdev"
+    Option "Device" "@KEYBOARD@"
+EndSection
+
+Section "ServerLayout"
+    Identifier "layout"
+    Screen "screen"
+    InputDevice "stylus"
+    InputDevice "mouse" "CorePointer"
+    InputDevice "touch"
+    InputDevice "keyboard" "CoreKeyboard"
+EndSection
