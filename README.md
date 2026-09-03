@@ -34,6 +34,11 @@ always.
 | `XOURNALPP_FILE` | unset | file under `/data/notes` to open at start |
 
 `/data/notes` holds the documents, `/data/config` the Xournal++ settings.
+Files in a directory mounted at `/seed` (`settings.xml`, `toolbar.ini`,
+`palette.gpl`, ...) are copied into `/data/config/xournalpp` at start when
+not already there. Xournal++ rewrites `settings.xml` itself, so the seed is
+never linked; delete a file under `/data/config/xournalpp` and restart to take
+the seed's version again.
 
 The pen device is created through `/dev/uinput` and its event node appears in
 the host's `/dev/input`, which is why that directory is bind mounted and the

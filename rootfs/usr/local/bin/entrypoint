@@ -6,8 +6,13 @@ set -euo pipefail
 WIDTH=${SCREEN%x*}
 HEIGHT=${SCREEN#*x}
 
-mkdir -p /data/notes "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" /tmp/.X11-unix
+mkdir -p /data/notes "$XDG_CONFIG_HOME/xournalpp" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" /tmp/.X11-unix
 chmod 1777 /tmp/.X11-unix
+
+# Copied, not linked: Xournal++ rewrites settings.xml on every change.
+if [ -d /seed ]; then
+    cp -n /seed/* "$XDG_CONFIG_HOME/xournalpp/" 2>/dev/null || true
+fi
 
 cleanup() {
     trap - TERM INT
