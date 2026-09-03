@@ -1,0 +1,65 @@
+diff --git a/lib/encode_video.c b/lib/encode_video.c
+index 6885ba4..aa41505 100644
+--- a/lib/encode_video.c
++++ b/lib/encode_video.c
+@@ -139,7 +139,10 @@ void set_codec_params(VideoContext* ctx)
+ 	ctx->c->time_base = TIME_BASE;
+ 	ctx->c->framerate = (AVRational){0, 1};
+ 
+-	ctx->c->gop_size = 12;
++	// A keyframe every 12 frames is 2.5 IDRs/s at 30fps; each one is a
++	// bandwidth spike, and the client re-decodes from the last one whenever it
++	// seeks to the live edge. The stream is not seekable, so they buy nothing.
++	ctx->c->gop_size = 600;
+ 	// no B-frames to reduce latency
+ 	ctx->c->max_b_frames = 0;
+ 	if (ctx->oc->oformat->flags & AVFMT_GLOBALHEADER)
+diff --git a/src/web.rs b/src/web.rs
+index dc844d3..783ff7c 100644
+--- a/src/web.rs
++++ b/src/web.rs
+@@ -302,6 +302,12 @@ async fn run_server(
+ 
+         debug!(address = ?remote_address, "Client connected.");
+ 
++        // Video frames are written as they are encoded; Nagle would hold each
++        // frame's tail until the peer acknowledges the previous one.
++        if let Err(err) = tcp.set_nodelay(true) {
++            warn!("Failed to set TCP_NODELAY: {err}.");
++        }
++
+         let io = TokioIo::new(tcp);
+ 
+         let sender_ui = sender_ui.clone();
+diff --git a/ts/lib.ts b/ts/lib.ts
+index 1fac274..a44b229 100644
+--- a/ts/lib.ts
++++ b/ts/lib.ts
+@@ -983,18 +983,22 @@ function handle_messages(
+         upd_buf();
+         frame_count += 1;
+ 
+-        // only seek if there is data available, some browsers choke otherwise
++        // Seeking to the live edge flushes the decoder and re-decodes from the
++        // last keyframe, on every frame. Playing slightly fast drains the same
++        // backlog without a flush; seek only when the gap is too big to close.
+         if (video.seekable.length > 0) {
+             let seek_time = video.seekable.end(video.seekable.length - 1);
+-            if (video.readyState >= (settings.check_aggressive_seek.checked ? 3 : 4)
+-                // but make sure to catch up if the video is more than 3 seconds behind
+-                || seek_time - video.currentTime > 3) {
++            let lag = seek_time - video.currentTime;
++            if (lag > 1) {
+                 if (isFinite(seek_time))
+                     video.currentTime = seek_time;
+                 else
+                     log(LogLevel.WARN, "Failed to seek to end of video.")
++                video.playbackRate = 1;
++            } else {
++                let target = settings.check_aggressive_seek.checked ? 0.08 : 0.5;
++                video.playbackRate = lag > target ? 1.1 : 1;
+             }
+-
+         }
+     }
+ }

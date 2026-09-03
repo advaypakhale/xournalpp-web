@@ -1,0 +1,22 @@
+diff --git a/src/input/uinput_device.rs b/src/input/uinput_device.rs
+index d849b4a..dceb3c7 100644
+--- a/src/input/uinput_device.rs
++++ b/src/input/uinput_device.rs
+@@ -504,7 +504,7 @@ impl InputDevice for UInputDevice {
+                                 .map_input_device_to_entire_screen(&self.name_stylus_device, true);
+                         }
+                     }
+-                    self.num_touch_mapping_tries += 1;
++                    self.num_stylus_mapping_tries += 1;
+                 }
+                 match event.event_type {
+                     PointerEventType::DOWN
+@@ -597,7 +597,7 @@ impl InputDevice for UInputDevice {
+                                 .map_input_device_to_entire_screen(&self.name_mouse_device, false);
+                         }
+                     }
+-                    self.num_touch_mapping_tries += 1;
++                    self.num_mouse_mapping_tries += 1;
+                 }
+                 match event.event_type {
+                     PointerEventType::DOWN
