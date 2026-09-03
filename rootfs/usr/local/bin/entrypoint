@@ -20,6 +20,16 @@ cleanup() {
 }
 trap cleanup TERM INT
 
+# Killing the container leaves an emergency save behind, and Xournal++ then
+# offers to restore it in a modal dialog. That dialog takes the keyboard, so no
+# shortcut works until it is answered, and dialogs do not appear in the video
+# stream, so it cannot be answered. Keep the file as an ordinary document
+# instead, where it can be opened normally.
+emergency="$XDG_CONFIG_HOME/xournalpp/emergencysave.xopp"
+if [ -e "$emergency" ]; then
+    mv "$emergency" "/data/notes/recovered-$(date +%Y%m%d-%H%M%S).xopp"
+fi
+
 weylus --no-gui --precreate-uinput --bind-address 0.0.0.0 --web-port 1701 \
     ${WEYLUS_ACCESS_CODE:+--access-code "$WEYLUS_ACCESS_CODE"} &
 
