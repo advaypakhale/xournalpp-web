@@ -6,6 +6,11 @@ set -euo pipefail
 WIDTH=${SCREEN%x*}
 HEIGHT=${SCREEN#*x}
 
+# Xournal++ publishes its tool state here; Weylus relays it to the browser so
+# the local ink overlay can match the real ink. Weylus starts first and
+# reconnects until Xournal++ is up.
+export XOURNALPP_TOOL_SOCKET=/run/xournalpp-tool.sock
+
 mkdir -p /data/notes "$XDG_CONFIG_HOME/xournalpp" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" /tmp/.X11-unix
 chmod 1777 /tmp/.X11-unix
 
@@ -30,13 +35,39 @@ if [ -e "$emergency" ]; then
     mv "$emergency" "/data/notes/recovered-$(date +%Y%m%d-%H%M%S).xopp"
 fi
 
+weylus_nodes() {
+    local dev
+    for dev in /sys/class/input/event*; do
+        case "$(cat "$dev/device/name" 2>/dev/null)" in
+            Weylus*) echo "${dev##*/}" ;;
+        esac
+    done
+}
+
+# Every container names its uinput devices identically and they all share the
+# host's /dev/input, so a name alone does not say which container a device
+# belongs to. Anything already present belongs to somebody else; ours are the
+# nodes that appear after this weylus starts.
+FOREIGN=$(weylus_nodes)
+
 weylus --no-gui --precreate-uinput --bind-address 0.0.0.0 --web-port 1701 \
+    --tool-state-socket "$XOURNALPP_TOOL_SOCKET" \
     ${WEYLUS_ACCESS_CODE:+--access-code "$WEYLUS_ACCESS_CODE"} &
+
+is_foreign() {
+    local node
+    for node in $FOREIGN; do
+        if [ "$node" = "$1" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
 
 event_node() {
     local dev
     for dev in /sys/class/input/event*; do
-        if [ "$(cat "$dev/device/name" 2>/dev/null)" = "$1" ]; then
+        if [ "$(cat "$dev/device/name" 2>/dev/null)" = "$1" ] && ! is_foreign "${dev##*/}"; then
             echo "/dev/input/${dev##*/}"
             return 0
         fi

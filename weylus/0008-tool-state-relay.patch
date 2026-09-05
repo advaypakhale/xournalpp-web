@@ -1,0 +1,913 @@
+diff --git a/src/config.rs b/src/config.rs
+index 27922e8..98b0028 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -121,6 +121,14 @@ pub struct Config {
+     )]
+     #[serde(default)]
+     pub precreate_uinput: bool,
++    #[cfg(target_os = "linux")]
++    #[arg(
++        long,
++        help = "Connect to this unix socket and forward each newline-delimited \
++                message read from it verbatim to connected clients."
++    )]
++    #[serde(default)]
++    pub tool_state_socket: Option<PathBuf>,
+ 
+     #[arg(long, help = "Print template of index.html served by Weylus.")]
+     #[serde(skip)]
+diff --git a/src/protocol.rs b/src/protocol.rs
+index 0507e93..90f4b1a 100644
+--- a/src/protocol.rs
++++ b/src/protocol.rs
+@@ -33,6 +33,12 @@ pub enum MessageOutbound {
+     CustomInputAreas(CustomInputAreas),
+     ConfigError(String),
+     Error(String),
++    /// Raw line relayed from the tool-state socket; Weylus does not interpret
++    /// it.
++    ToolState(String),
++    /// Size of the captured screen in pixels, before any downscaling for
++    /// encoding.
++    CaptureSize { width: usize, height: usize },
+ }
+ 
+ #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+diff --git a/src/web.rs b/src/web.rs
+index 783ff7c..7761ceb 100644
+--- a/src/web.rs
++++ b/src/web.rs
+@@ -169,6 +169,13 @@ async fn serve(
+                     Ok(ws) => {
+                         let (sender, receiver) =
+                             weylus_websocket_channel(ws, semaphore_websocket_shutdown);
++                        #[cfg(target_os = "linux")]
++                        if let Some(path) = config.tool_state_socket.clone() {
++                            let sender = sender.clone();
++                            std::thread::spawn(move || {
++                                crate::websocket::relay_tool_state(path, sender)
++                            });
++                        }
+                         std::thread::spawn(move || {
+                             let client = WeylusClientHandler::new(
+                                 sender,
+diff --git a/src/websocket.rs b/src/websocket.rs
+index e302276..13f1696 100644
+--- a/src/websocket.rs
++++ b/src/websocket.rs
+@@ -64,6 +64,8 @@ pub struct WeylusClientConfig {
+     pub wayland_support: bool,
+     #[cfg(target_os = "linux")]
+     pub shared_uinput: Option<Arc<Mutex<crate::input::uinput_device::UInputDevice>>>,
++    #[cfg(target_os = "linux")]
++    pub tool_state_socket: Option<std::path::PathBuf>,
+     pub no_gui: bool,
+ }
+ 
+@@ -422,6 +424,16 @@ fn handle_video<S: WeylusSender + Clone + 'static>(
+                         .unwrap()
+                         .check_size(width_in, height_in, width_out, height_out)
+                 {
++                    // The encoded video may be smaller than the capture; the
++                    // client needs the capture size to map remote pixels to
++                    // display pixels.
++                    send_message(
++                        &mut sender,
++                        MessageOutbound::CaptureSize {
++                            width: width_in,
++                            height: height_in,
++                        },
++                    );
+                     send_message(&mut sender, MessageOutbound::NewVideo);
+                     let mut sender = sender.clone();
+                     let res = VideoEncoder::new(
+@@ -495,6 +507,77 @@ impl WeylusSender for WsWeylusSender {
+     }
+ }
+ 
++/// Forwards newline-delimited messages from a unix socket to one websocket
++/// client. Retries with backoff while the socket does not exist and reconnects
++/// when the peer goes away; exits once the websocket client is gone. Knows
++/// nothing about the payload.
++#[cfg(target_os = "linux")]
++pub fn relay_tool_state(path: std::path::PathBuf, sender: WsWeylusSender) {
++    use std::io::{BufRead, BufReader, ErrorKind};
++    use std::os::unix::net::UnixStream;
++
++    const BACKOFF_START: Duration = Duration::from_millis(250);
++    const BACKOFF_MAX: Duration = Duration::from_secs(2);
++
++    let mut backoff = BACKOFF_START;
++    'reconnect: loop {
++        if sender.sender.is_closed() {
++            return;
++        }
++        let stream = match UnixStream::connect(&path) {
++            Ok(stream) => stream,
++            Err(_) => {
++                std::thread::sleep(backoff);
++                backoff = (backoff * 2).min(BACKOFF_MAX);
++                continue;
++            }
++        };
++        backoff = BACKOFF_START;
++        // A finite read timeout lets the loop notice a vanished websocket
++        // client even while the tool state is silent.
++        if stream
++            .set_read_timeout(Some(Duration::from_secs(2)))
++            .is_err()
++        {
++            continue;
++        }
++        let mut reader = BufReader::new(stream);
++        let mut line = String::new();
++        loop {
++            if sender.sender.is_closed() {
++                return;
++            }
++            match reader.read_line(&mut line) {
++                Ok(0) => continue 'reconnect,
++                Ok(_) => {
++                    let msg = line.trim_end().to_string();
++                    line.clear();
++                    if !msg.is_empty()
++                        && sender
++                            .sender
++                            .blocking_send(WsMessage::MessageOutbound(MessageOutbound::ToolState(
++                                msg,
++                            )))
++                            .is_err()
++                    {
++                        return;
++                    }
++                }
++                // partial data before the timeout stays in `line`
++                Err(err)
++                    if matches!(
++                        err.kind(),
++                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
++                    ) =>
++                {
++                    continue
++                }
++                Err(_) => continue 'reconnect,
++            }
++        }
++    }
++}
++
+ pub fn weylus_websocket_channel(
+     websocket: WebSocket<TokioIo<Upgraded>>,
+     semaphore_shutdown: Arc<tokio::sync::Semaphore>,
+diff --git a/src/weylus.rs b/src/weylus.rs
+index c230f57..ad96992 100644
+--- a/src/weylus.rs
++++ b/src/weylus.rs
+@@ -85,6 +85,8 @@ impl Weylus {
+                 wayland_support: config.wayland_support,
+                 #[cfg(target_os = "linux")]
+                 shared_uinput,
++                #[cfg(target_os = "linux")]
++                tool_state_socket: config.tool_state_socket.clone(),
+                 no_gui: config.no_gui,
+             },
+         );
+diff --git a/ts/lib.ts b/ts/lib.ts
+index 2e91228..6d22277 100644
+--- a/ts/lib.ts
++++ b/ts/lib.ts
+@@ -119,6 +119,7 @@ class Settings {
+     ink_latency_input: HTMLInputElement;
+     ink_thickness_input: HTMLInputElement;
+     ink_color_input: HTMLInputElement;
++    ink_mode_output: HTMLOutputElement;
+     check_aggressive_seek: HTMLInputElement;
+     client_name_input: HTMLInputElement;
+     visible: boolean;
+@@ -139,6 +140,7 @@ class Settings {
+         this.ink_latency_input = document.getElementById("ink_latency") as HTMLInputElement;
+         this.ink_thickness_input = document.getElementById("ink_thickness") as HTMLInputElement;
+         this.ink_color_input = document.getElementById("ink_color") as HTMLInputElement;
++        this.ink_mode_output = document.getElementById("ink_mode") as HTMLOutputElement;
+         this.client_name_input = document.getElementById("client_name") as HTMLInputElement;
+         this.frame_rate_input.oninput = () => {
+             this.frame_rate_output.value = Math.round(frame_rate_scale(this.frame_rate_input.valueAsNumber)).toString();
+@@ -426,6 +428,15 @@ class Settings {
+     video_enabled(): boolean {
+         return this.checks.get("enable_video").checked;
+     }
++
++    // The manual thickness/color sliders only apply while no tool state has
++    // arrived from the server; grey them out otherwise so it is obvious which
++    // mode the overlay is in.
++    set_ink_mode(live: boolean, desc: string) {
++        this.ink_mode_output.value = desc;
++        this.ink_thickness_input.disabled = live;
++        this.ink_color_input.disabled = live;
++    }
+ }
+ 
+ let settings: Settings;
+@@ -716,43 +727,152 @@ class Painter {
+     }
+ }
+ 
++/* Xournal++'s constants, so the echo admits and widens points the way the
++ * server does. The first two are settings on the server, the rest are compiled
++ * into Xournal++. */
++const XPP_MIN_PRESSURE = 0.09;              // Settings::minimumPressure
++const XPP_PRESSURE_MULTIPLIER = 1.6;        // Settings::pressureMultiplier
++const XPP_STABILIZER_BUFSIZE = 3;           // stabilizerBuffersize, ARITHMETIC averaging
++const XPP_PIXEL_MOTION_THRESHOLD = 0.3;     // InputHandler::PIXEL_MOTION_THRESHOLD
++const XPP_MAX_WIDTH_VARIATION = 0.3;        // StrokeHandler::MAX_WIDTH_VARIATION
++const XPP_SPLINE_MIN_KNOT_DISTANCE = 0.3;   // SplineSegment::MIN_KNOT_DISTANCE
++const XPP_SPLINE_FLATNESS_TOLERANCE = 1.0001;
++const XPP_SPLINE_MAX_WIDTH_VARIATION = 0.1;
++const XPP_NO_PRESSURE = -1;                 // Point::NO_PRESSURE
++// Full scale of the uinput absolute axes the pen events are sent on.
++const WIRE_ABS_MAX = 65535;
++
+ class InkPoint {
++    // document units (PostScript points), the space Stroke::points lives in
+     x: number;
+     y: number;
+-    // stroke width in CSS pixels, already scaled by pressure
+-    w: number;
++    // stroke diameter at this point, in document units; -1 means "no pressure"
++    z: number;
++    // timestamp of the event that produced the point, on performance.now()'s
++    // clock, so the trailing window can find the part not yet on the video
+     t: number;
+ }
+ 
+ class InkStroke {
+     points: InkPoint[] = [];
++    color: string;
++    alpha: number;
++    // Stroke::getWidth(), the tool thickness in document points
++    width: number;
++    // Only the pen is pressure sensitive (Stroke.h:34); every point of the
++    // highlighter and the eraser carries z = -1 and one constant width.
++    has_pressure: boolean;
++    // ZoomControl::getZoom(), latched at pen-down the way the stabilizer
++    // latches it (StrokeStabilizer.h:57) and not updated mid-stroke
++    zoom: number;
++    // capture pixels across the video box, to map document units back to css
++    cap_w: number;
++    cap_h: number;
++    // stabilizer ring buffer, newest first, in capture pixels
++    buf: number[][];
++    // PenInputHandler::lastPressure: the raw axis value, kept to stand in for
++    // an event that arrives without one
++    last_raw_pressure: number;
++    buttons: number;
++    // timestamp of the event being processed, stamped onto every point it emits
++    stamp: number;
++    // performance.now() at pen-up, 0 while the pen is still down
++    done_at: number;
++}
++
++class ToolState {
++    tool: string;
++    color: string;
++    alpha: number;
++    thickness: number;
++    zoom: number;
+ }
+ 
+ /* Echoes pen input on a transparent canvas above the video while the real ink
+- * makes the round trip through the server. Only the trailing "Latency window"
+- * milliseconds of each stroke are drawn; older parts are assumed to be visible
+- * in the video underneath, so the tail simply runs out and no retire event is
+- * needed. The stroke geometry imitates Xournal++'s pen rendering so the echo
+- * and the video ink line up. */
++ * makes the round trip through the server.
++ *
++ * Both halves of Xournal++'s pen pipeline are reproduced here: which points
++ * reach the stroke (the arithmetic stabilizer, the 0.3-document-unit admission
++ * threshold, the width subdivision and the pen-up spline tail) and how they are
++ * rasterised (the union of one capsule per segment, filled once). Everything
++ * runs in document units; only the final transform maps them to the screen.
++ *
++ * Only the last "Latency window" milliseconds of a stroke are drawn. The older
++ * part has already come back on the video, and drawing over it reads as bolder
++ * ink however exact the geometry is: the video's copy has been through a lossy
++ * encoder and the canvas's has not, and two translucent highlighter passes
++ * genuinely do multiply.
++ *
++ * The echo is dropped outright at pen-up rather than fading: Xournal++'s shape
++ * recognizer can replace the finished stroke with something else entirely, so
++ * nothing about it can be trusted past the handoff. */
+ class InkOverlay {
+     canvas: HTMLCanvasElement;
+     ctx: CanvasRenderingContext2D;
+     strokes: InkStroke[];
+     active: Map<number, InkStroke>;
+-    // per-pointer [x, y, pressure] input history for the stabilizer
+-    raw: Map<number, [number, number, number][]>;
+     was_clear: boolean;
++    tool_state: ToolState;
++    capture_width: number;
++    capture_height: number;
++    // the video box in css pixels, from the last event
++    rect_x: number;
++    rect_y: number;
++    rect_w: number;
++    rect_h: number;
+ 
+     constructor(canvas: HTMLCanvasElement) {
+         this.canvas = canvas;
+         this.ctx = canvas.getContext("2d");
+         this.strokes = [];
+         this.active = new Map();
+-        this.raw = new Map();
+         this.was_clear = true;
++        this.tool_state = null;
++        this.capture_width = 0;
++        this.capture_height = 0;
++        this.rect_x = 0;
++        this.rect_y = 0;
++        this.rect_w = 0;
++        this.rect_h = 0;
+         this.resize();
+         window.addEventListener("resize", () => this.resize());
+         requestAnimationFrame(() => this.render());
++        this.update_mode();
++    }
++
++    set_tool_state(json: string) {
++        try {
++            let state = JSON.parse(json);
++            if (typeof state.tool == "string" && typeof state.color == "string"
++                && typeof state.alpha == "number" && typeof state.thickness == "number"
++                && typeof state.zoom == "number")
++                this.tool_state = state;
++            else
++                log(LogLevel.WARN, "Incomplete tool state: " + json);
++        } catch {
++            log(LogLevel.WARN, "Malformed tool state: " + json);
++        }
++        this.update_mode();
++    }
++
++    set_capture_size(width: number, height: number) {
++        this.capture_width = width;
++        this.capture_height = height;
++        this.update_mode();
++    }
++
++    live(): boolean {
++        return this.tool_state != null && this.capture_width > 0 && this.capture_height > 0;
++    }
++
++    update_mode() {
++        if (this.live()) {
++            let s = this.tool_state;
++            settings.set_ink_mode(true,
++                "auto: " + s.tool + " " + s.color + " " + s.thickness.toFixed(2) + "pt @" + s.zoom.toFixed(2) + "x");
++        } else {
++            settings.set_ink_mode(false, "manual (no tool state from server)");
++        }
+     }
+ 
+     resize() {
+@@ -764,58 +884,350 @@ class InkOverlay {
+         return check_video.checked && settings.checks.get("local_ink").checked;
+     }
+ 
+-    feed(event_type: string, event: PointerEvent) {
++    feed(event_type: string, event: PointerEvent, rect: DOMRect) {
++        this.rect_x = rect.left;
++        this.rect_y = rect.top;
++        this.rect_w = rect.width;
++        this.rect_h = rect.height;
++
+         let id = event.pointerId;
+-        // No cleanup on pointerup is required for correctness, the tail ages
+-        // out regardless; dropping the state here merely frees it early and
+-        // separates strokes of a reused pointer id.
+-        if (event_type != "pointerdown" && event_type != "pointermove") {
+-            this.active.delete(id);
+-            this.raw.delete(id);
++        let s = this.active.get(id);
++        if (event.pointerType != "pen" && event.pointerType != "mouse") {
++            if (s)
++                this.discard(id);
++            return;
++        }
++        if (event_type == "pointerdown") {
++            this.discard(id);
++            if (this.enabled() && (event.buttons & 1) != 0)
++                this.begin(id, event);
+             return;
+         }
+-        if (!this.enabled())
++        if (!s)
+             return;
+-        // Only the pen tip and the left mouse button leave ink: the barrel
+-        // button and the eraser tip make Xournal++ switch tools.
+-        if (event.buttons != 1 || (event.pointerType != "pen" && event.pointerType != "mouse")) {
+-            this.active.delete(id);
+-            this.raw.delete(id);
++        if (event_type == "pointermove") {
++            // With inputSystemTPCButton set, Xournal++ ends the stroke on any
++            // button release, barrel included, and ignores presses mid-stroke.
++            if ((s.buttons & ~event.buttons) != 0)
++                this.finish(id, event);
++            else {
++                s.buttons = event.buttons;
++                this.motion(s, event);
++            }
++            return;
++        }
++        if (event_type == "pointerup") {
++            this.finish(id, event);
+             return;
+         }
++        // pointercancel and the crossing events: the stroke's fate is now the
++        // server's business, so stop echoing it.
++        this.discard(id);
++    }
+ 
+-        let pressure = Math.max(event.pressure, settings.range_min_pressure.valueAsNumber);
+-        // Xournal++'s pressure pipeline with the settings used on the server:
+-        // minimumPressure = 0.09, pressureMultiplier = 1.6 (PenInputHandler).
+-        pressure = Math.max(0.09, pressure * 1.6);
+-
+-        let buf = this.raw.get(id);
+-        let stroke = this.active.get(id);
+-        if (event_type == "pointerdown" || !buf || !stroke) {
+-            buf = [];
+-            this.raw.set(id, buf);
+-            stroke = new InkStroke();
+-            this.strokes.push(stroke);
+-            this.active.set(id, stroke);
++    private discard(id: number) {
++        let s = this.active.get(id);
++        if (!s)
++            return;
++        this.active.delete(id);
++        this.strokes = this.strokes.filter((o) => o !== s);
++    }
++
++    /* The wire carries the position normalised to the video box and truncated
++     * onto the uinput axis grid (uinput_device.rs transform_x/transform_y), so
++     * the server's pen never lands between device units. Quantise the echo the
++     * same way: the two streams have to agree about which events clear the
++     * admission threshold, not merely about where the pen is. */
++    private wire_pos(s: InkStroke, event: PointerEvent): number[] {
++        let nx = (event.clientX - this.rect_x) / this.rect_w;
++        let ny = (event.clientY - this.rect_y) / this.rect_h;
++        return [Math.trunc(nx * WIRE_ABS_MAX) / WIRE_ABS_MAX * s.cap_w,
++                Math.trunc(ny * WIRE_ABS_MAX) / WIRE_ABS_MAX * s.cap_h];
++    }
++
++    private wire_pressure(event: PointerEvent): number {
++        let p = Math.max(event.pressure, settings.range_min_pressure.valueAsNumber);
++        return Math.trunc(p * WIRE_ABS_MAX) / WIRE_ABS_MAX;
++    }
++
++    // PenInputHandler::filterPressure. The floor is applied after the gain, and
++    // there is no ceiling.
++    private filter_pressure(s: InkStroke, raw: number): number {
++        if (raw == XPP_NO_PRESSURE)
++            raw = s.last_raw_pressure;
++        else
++            s.last_raw_pressure = raw;
++        return Math.max(XPP_MIN_PRESSURE, raw * XPP_PRESSURE_MULTIPLIER);
++    }
++
++    private begin(id: number, event: PointerEvent) {
++        let s = new InkStroke();
++        if (this.live()) {
++            let t = this.tool_state;
++            if (t.tool != "pen" && t.tool != "highlighter")
++                return;                     // the other tools leave no ink
++            s.color = t.color;
++            s.alpha = t.alpha;
++            s.width = t.thickness;
++            s.has_pressure = t.tool == "pen";
++            s.zoom = t.zoom;
++            s.cap_w = this.capture_width;
++            s.cap_h = this.capture_height;
++        } else {
++            // Without the tool state neither the thickness nor the zoom can be
++            // known, so run the pipeline at zoom 1 in css pixels and take the
++            // width from the slider. The thresholds then mean css pixels too,
++            // which is the closest this can get.
++            s.color = settings.ink_color_input.value;
++            s.alpha = 1;
++            s.width = settings.ink_thickness_input.valueAsNumber;
++            s.has_pressure = true;
++            s.zoom = 1;
++            s.cap_w = this.rect_w;
++            s.cap_h = this.rect_h;
+         }
+-        // Arithmetic mean of the last 3 points including pressure, matching
+-        // Xournal++'s stabilizer settings on the server (StrokeStabilizer).
+-        buf.push([event.clientX, event.clientY, pressure]);
+-        if (buf.length > 3)
+-            buf.shift();
++        if (!(s.width > 0) || !(s.zoom > 0) || !(s.cap_w > 0) || !(s.cap_h > 0))
++            return;
++        s.buf = [];
++        s.last_raw_pressure = 0;
++        s.buttons = event.buttons;
++        s.stamp = event.timeStamp;
++        s.done_at = 0;
++
++        let pos = this.wire_pos(s, event);
++        let pressure = this.filter_pressure(s, this.wire_pressure(event));
++        // The first point skips the stabilizer and the admission threshold
++        // entirely (StrokeHandler::onButtonPressEvent).
++        s.points.push({
++            x: pos[0] / s.zoom,
++            y: pos[1] / s.zoom,
++            z: s.has_pressure ? pressure * s.width : XPP_NO_PRESSURE,
++            t: s.stamp,
++        });
++        // CircularBuffer::assign fills every slot with the pen-down event, and
++        // the mean always divides by the buffer's fixed length, so there is no
++        // ramp-up: the first motion point sits two thirds of the way back.
++        for (let i = 0; i < XPP_STABILIZER_BUFSIZE; i++)
++            s.buf.push([pos[0], pos[1], pressure]);
++
++        this.strokes.push(s);
++        this.active.set(id, s);
++    }
++
++    private motion(s: InkStroke, event: PointerEvent) {
++        s.stamp = event.timeStamp;
++        let pos = this.wire_pos(s, event);
++        let pressure = this.filter_pressure(s, this.wire_pressure(event));
++        if (pressure == 0)
++            return;                         // StrokeHandler.cpp:61
++        s.buf.unshift([pos[0], pos[1], pressure]);
++        s.buf.length = XPP_STABILIZER_BUFSIZE;
+         let x = 0, y = 0, p = 0;
+-        for (const [bx, by, bp] of buf) {
+-            x += bx;
+-            y += by;
+-            p += bp;
++        for (const e of s.buf) {
++            x += e[0];
++            y += e[1];
++            p += e[2];
+         }
+-        let n = buf.length;
+-        stroke.points.push({
+-            x: x / n,
+-            y: y / n,
+-            w: p / n * settings.ink_thickness_input.valueAsNumber,
+-            t: event.timeStamp,
++        let d = XPP_STABILIZER_BUFSIZE;
++        this.paint_to(s, x / d / s.zoom, y / d / s.zoom, p / d);
++    }
++
++    private finish(id: number, event: PointerEvent) {
++        let s = this.active.get(id);
++        if (!s)
++            return;
++        this.active.delete(id);
++        s.stamp = event.timeStamp;
++        // The release event is filtered but never enters the stabilizer, so the
++        // spline tail runs to the newest raw motion event still in the buffer.
++        let release = this.filter_pressure(s, this.wire_pressure(event));
++        this.spline_tail(s, s.buf[0]);
++        if (s.points.length == 1) {
++            let pt = { x: s.points[0].x, y: s.points[0].y, z: s.points[0].z, t: s.points[0].t };
++            if (s.has_pressure)
++                s.points[0].z = Math.max(pt.z, release * s.width);
++            // The duplicate carries the OLD z, which is never read: a segment
++            // takes the width of its first point.
++            s.points.push(pt);
++        }
++        s.done_at = performance.now();
++    }
++
++    // StrokeHandler::paintTo
++    private paint_to(s: InkStroke, px: number, py: number, pz: number) {
++        if (s.has_pressure && pz > 0.0)
++            pz *= s.width;
++        let pts = s.points;
++        if (pts.length > 0) {
++            let end = pts[pts.length - 1];
++            let distance = Math.hypot(px - end.x, py - end.y);
++            if (distance < XPP_PIXEL_MOTION_THRESHOLD) {
++                // A rejected event still moved the stabilizer's mean; on top of
++                // that, while the stroke is a single point a rejected event can
++                // ratchet that point's width up, never down.
++                if (pts.length == 1 && s.has_pressure && end.z < pz) {
++                    end.z = pz;
++                    // the fattened dot is new ink, so restart its window
++                    end.t = s.stamp;
++                }
++                return;
++            }
++            if (s.has_pressure) {
++                let width_delta = pz - end.z;
++                if (-width_delta > XPP_MAX_WIDTH_VARIATION || width_delta > XPP_MAX_WIDTH_VARIATION) {
++                    let steps = Math.min(Math.ceil(Math.abs(width_delta) / XPP_MAX_WIDTH_VARIATION),
++                                         Math.floor(distance / XPP_PIXEL_MOTION_THRESHOLD));
++                    let step = 1 / steps;
++                    let ix = (px - end.x) * step;
++                    let iy = (py - end.y) * step;
++                    let iz = width_delta * step;
++                    // z runs one increment ahead of x and y: StrokeHandler.cpp
++                    // advances the width once before the loop and again inside
++                    // it. The bias is Xournal++'s and is reproduced on purpose.
++                    for (let i = 1; i < steps; i++)
++                        pts.push({
++                            x: end.x + i * ix,
++                            y: end.y + i * iy,
++                            z: end.z + (i + 1) * iz,
++                            t: s.stamp,
++                        });
++                }
++            }
++        }
++        pts.push({ x: px, y: py, z: s.has_pressure ? pz : XPP_NO_PRESSURE, t: s.stamp });
++    }
++
++    /* StrokeStabilizer::Active::quadraticSplineTo: on pen-up a quadratic spline
++     * closes the lag the averaging introduced, and the second-to-last point's
++     * width is rewritten. None of these points go through paintTo, so the
++     * admission threshold does not apply to them. */
++    private spline_tail(s: InkStroke, ev: number[]) {
++        let pts = s.points;
++        let n = pts.length;
++        if (n == 0)
++            return;
++        if (n == 1) {
++            this.paint_to(s, ev[0] / s.zoom, ev[1] / s.zoom, ev[2]);
++            return;
++        }
++        let B = { x: pts[n - 1].x, y: pts[n - 1].y, z: pts[n - 1].z, t: pts[n - 1].t };
++        let A = pts[n - 2];
++        let C = {
++            x: ev[0] / s.zoom,
++            y: ev[1] / s.zoom,
++            z: s.has_pressure ? ev[2] * s.width : XPP_NO_PRESSURE,
++            t: s.stamp,
++        };
++        let abx = B.x - A.x, aby = B.y - A.y;
++        let bcx = C.x - B.x, bcy = C.y - B.y;
++        let sq_bc = bcx * bcx + bcy * bcy;
++        let norm_bc = Math.sqrt(sq_bc);
++        let norm_ab = Math.hypot(abx, aby);
++        if (norm_bc < Number.EPSILON)
++            return;
++        if (norm_ab < Number.EPSILON) {
++            this.paint_to(s, ev[0] / s.zoom, ev[1] / s.zoom, ev[2]);
++            return;
++        }
++        let distance = Math.min(Math.abs(sq_bc * norm_ab / (2 * (abx * bcx + aby * bcy))), norm_bc);
++        if (s.has_pressure) {
++            let coeff = norm_bc / 2 + distance;
++            B.z = (coeff * A.z + norm_ab * C.z) / (norm_ab + coeff);
++            pts[n - 1].z = B.z;
++        }
++        let rel = (p: InkPoint, q: InkPoint, r: number) => ({
++            x: p.x + r * (q.x - p.x),
++            y: p.y + r * (q.y - p.y),
++            z: p.z + r * (q.z - p.z),
++            t: s.stamp,
+         });
++        let Q = rel(B, A, -distance / norm_ab);
++        let fp = rel(B, Q, 2 / 3);
++        let sp = rel(C, Q, 2 / 3);
++
++        let seq: InkPoint[] = [];
++        InkOverlay.point_sequence(B, fp, sp, C, s.has_pressure, seq);
++        for (let i = 1; i < seq.length; i++) {    // B has already been painted
++            seq[i].t = s.stamp;
++            pts.push(seq[i]);
++        }
++        pts.push(C);
++    }
++
++    // SplineSegment::toPointSequence, de Casteljau at t = 0.5
++    private static point_sequence(k0: InkPoint, c0: InkPoint, c1: InkPoint, k1: InkPoint,
++                                  use_pressure: boolean, out: InkPoint[]) {
++        let l1 = Math.hypot(k0.x - c0.x, k0.y - c0.y);
++        let l2 = Math.hypot(c0.x - c1.x, c0.y - c1.y);
++        let l3 = Math.hypot(c1.x - k1.x, c1.y - k1.y);
++        let l = Math.hypot(k0.x - k1.x, k0.y - k1.y);
++        if (l < XPP_SPLINE_MIN_KNOT_DISTANCE
++            || (l1 + l2 + l3 < XPP_SPLINE_FLATNESS_TOLERANCE * l
++                && (!use_pressure || Math.abs(k0.z - k1.z) <= XPP_SPLINE_MAX_WIDTH_VARIATION))) {
++            out.push(k0);
++            return;
++        }
++        let mid = (p: InkPoint, q: InkPoint) => ({
++            x: (p.x + q.x) / 2,
++            y: (p.y + q.y) / 2,
++            z: XPP_NO_PRESSURE,             // only knot widths are ever read
++            t: 0,                           // stamped by the caller if emitted
++        });
++        let b0 = mid(k0, c0), b1 = mid(c0, c1), b2 = mid(c1, k1);
++        let e0 = mid(b0, b1), e1 = mid(b1, b2);
++        let d0 = mid(e0, e1);
++        // At t = 0.5 the inverted weights in SplineSegment::subdivide reduce to
++        // the midpoint, so the apparent bug there is inert.
++        if (use_pressure)
++            d0.z = 0.5 * k0.z + 0.5 * k1.z;
++        InkOverlay.point_sequence(k0, b0, e0, d0, use_pressure, out);
++        InkOverlay.point_sequence(d0, e1, b2, k1, use_pressure, out);
++    }
++
++    /* The region Xournal++ fills is exactly the union of one capsule per
++     * segment, each at the CONSTANT radius of half its FIRST point's width:
++     * the width is never interpolated along a segment, and the last point's
++     * width is never read at all — the end cap takes its radius from the
++     * point before it. Getting that wrong is what tapers the pen tip.
++     *
++     * All the capsules go into one path and are filled once with the nonzero
++     * winding rule, which unions them. Filling them one at a time would
++     * composite their antialiased edges together and fatten every joint.
++     *
++     * Each capsule starts on its own circle rather than at its centre: arc()
++     * prepends a line from the current point, and closePath() returns to the
++     * subpath's start, so starting at the centre cuts a wedge out of the
++     * capsule.
++     *
++     * `from` is the trailing window's first point. Windowing cannot disturb the
++     * widths: segment i takes its radius from pts[i], so dropping a prefix
++     * leaves every surviving segment on the width it already had. */
++    private static contour(pts: InkPoint[], from: number): Path2D {
++        let path = new Path2D();
++        if (pts.length - from == 2 && pts[from].x == pts[from + 1].x && pts[from].y == pts[from + 1].y) {
++            path.arc(pts[from].x, pts[from].y, 0.5 * pts[from].z, 0, 2 * Math.PI);
++            return path;
++        }
++        for (let i = from; i + 1 < pts.length; i++) {
++            let a = pts[i], b = pts[i + 1], r = 0.5 * a.z;
++            if (!(r > 0))
++                continue;
++            let dx = b.x - a.x, dy = b.y - a.y;
++            let len = Math.hypot(dx, dy);
++            if (len == 0) {
++                path.moveTo(a.x + r, a.y);
++                path.arc(a.x, a.y, r, 0, 2 * Math.PI, false);
++                path.closePath();
++                continue;
++            }
++            let th = Math.atan2(dy, dx);
++            let start = th + Math.PI / 2, end = th - Math.PI / 2;
++            path.moveTo(a.x + r * Math.cos(start), a.y + r * Math.sin(start));
++            path.arc(a.x, a.y, r, start, end, false);
++            path.arc(b.x, b.y, r, end, start, false);
++            path.closePath();
++        }
++        return path;
+     }
+ 
+     render() {
+@@ -823,23 +1235,12 @@ class InkOverlay {
+         let latency = settings.ink_latency_input.valueAsNumber;
+         if (!isFinite(latency))
+             latency = 90;
+-        let cutoff = performance.now() - latency;
+-        for (const stroke of this.strokes) {
+-            let pts = stroke.points;
+-            // keep one point beyond the cutoff so the tail stays attached to
+-            // the ink that has already reached the video
+-            while (pts.length >= 2 && pts[1].t < cutoff)
+-                pts.shift();
+-            if (pts.length == 1 && pts[0].t < cutoff)
+-                pts.shift();
+-        }
+-        if (this.strokes.some((s) => s.points.length == 0)) {
+-            let live = new Set(this.active.values());
+-            this.strokes = this.strokes.filter((s) => s.points.length > 0 || live.has(s));
+-        }
++        let now = performance.now();
++        if (this.strokes.some((s) => s.done_at != 0 && now - s.done_at > latency))
++            this.strokes = this.strokes.filter((s) => s.done_at == 0 || now - s.done_at <= latency);
+ 
+         let ctx = this.ctx;
+-        if (!this.enabled() || !this.strokes.some((s) => s.points.length > 1)) {
++        if (!this.enabled() || this.strokes.length == 0 || this.rect_w <= 0 || this.rect_h <= 0) {
+             if (!this.was_clear) {
+                 ctx.setTransform(1, 0, 0, 1, 0, 0);
+                 ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+@@ -850,37 +1251,59 @@ class InkOverlay {
+ 
+         ctx.setTransform(1, 0, 0, 1, 0, 0);
+         ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+-        // draw in CSS pixels on the devicePixelRatio-scaled backing store
+         let dpr = window.devicePixelRatio;
+-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+-        ctx.lineCap = "round";
+-        ctx.lineJoin = "round";
+-        ctx.strokeStyle = settings.ink_color_input.value;
+-        // ramp alpha over the older half of the window so the handoff to the
+-        // video ink has no visible seam
+-        let fade = Math.max(1, latency / 2);
+-        for (const stroke of this.strokes) {
+-            let pts = stroke.points;
+-            for (let i = 1; i < pts.length; i++) {
+-                let a = pts[i - 1];
+-                let b = pts[i];
+-                // alpha from the newer endpoint, so the segment straddling the
+-                // cutoff is still drawn (faintly) and the tail has no gap
+-                let alpha = Math.min(1, (b.t - cutoff) / fade);
+-                if (alpha <= 0)
+-                    continue;
+-                // one stroke() per segment with the width of its first point,
+-                // the way Xournal++ renders pressure-varying strokes
+-                ctx.globalAlpha = alpha;
+-                ctx.lineWidth = a.w;
++        let cutoff = now - latency;
++        let drew = false;
++        for (const s of this.strokes) {
++            let pts = s.points;
++            let n = pts.length;
++            if (n == 0 || pts[n - 1].t < cutoff)
++                continue;                   // the video already has all of it
++            // Segment i is still ours while its far end is newer than the
++            // cutoff, so the window starts one point before the first such
++            // segment and stays attached to the ink already on the video.
++            let from = 0;
++            while (from + 1 < n && pts[from + 1].t < cutoff)
++                from++;
++
++            // Document units to device pixels. x and y scale independently
++            // because the video box does: the real ink is stretched by the same
++            // factors on its way to the screen, round caps and all.
++            let sx = s.zoom * this.rect_w / s.cap_w;
++            let sy = s.zoom * this.rect_h / s.cap_h;
++            ctx.setTransform(dpr * sx, 0, 0, dpr * sy, dpr * this.rect_x, dpr * this.rect_y);
++            ctx.globalAlpha = s.alpha;
++            drew = true;
++            if (s.has_pressure) {
++                ctx.fillStyle = s.color;
++                if (n - from == 1) {
++                    // StrokeToolView::drawDot: a round-capped zero-length
++                    // stroke, which is a disc
++                    let p = pts[from];
++                    let dot = new Path2D();
++                    dot.arc(p.x, p.y, 0.5 * p.z, 0, 2 * Math.PI);
++                    ctx.fill(dot, "nonzero");
++                } else {
++                    ctx.fill(InkOverlay.contour(pts, from), "nonzero");
++                }
++            } else {
++                // StrokeViewHelper::drawNoPressure: a plain polyline stroked at
++                // the tool's width, round cap and round join
++                ctx.strokeStyle = s.color;
++                ctx.lineWidth = s.width;
++                ctx.lineCap = "round";
++                ctx.lineJoin = "round";
+                 ctx.beginPath();
+-                ctx.moveTo(a.x, a.y);
+-                ctx.lineTo(b.x, b.y);
++                ctx.moveTo(pts[from].x, pts[from].y);
++                for (let i = from + 1; i < n; i++)
++                    ctx.lineTo(pts[i].x, pts[i].y);
++                if (n - from == 1)
++                    ctx.lineTo(pts[from].x, pts[from].y);
+                 ctx.stroke();
+             }
+         }
+         ctx.globalAlpha = 1;
+-        this.was_clear = false;
++        this.was_clear = !drew;
+     }
+ }
+ 
+@@ -1005,7 +1428,7 @@ class PointerHandler {
+             const events = event_type === "pointermove" && typeof event.getCoalescedEvents === 'function' ? event.getCoalescedEvents() : [event];
+             for (let event of events) {
+                 if (ink_overlay)
+-                    ink_overlay.feed(event_type, event);
++                    ink_overlay.feed(event_type, event, rect);
+                 this.webSocket.send(
+                     JSON.stringify(
+                         {
+@@ -1172,6 +1595,12 @@ function handle_messages(
+                     settings.custom_input_areas = msg["CustomInputAreas"];
+                     settings.checks.get("enable_custom_input_areas").checked = true;
+                     settings.save_settings();
++                } else if ("ToolState" in msg) {
++                    if (ink_overlay)
++                        ink_overlay.set_tool_state(msg["ToolState"]);
++                } else if ("CaptureSize" in msg) {
++                    if (ink_overlay)
++                        ink_overlay.set_capture_size(msg["CaptureSize"]["width"], msg["CaptureSize"]["height"]);
+                 }
+             }
+ 
+diff --git a/www/templates/index.html b/www/templates/index.html
+index 8c7cd2d..1bcf3ea 100644
+--- a/www/templates/index.html
++++ b/www/templates/index.html
+@@ -67,6 +67,7 @@
+             <h3>Local Ink</h3>
+             <section>
+                 <label><input type="checkbox" id="local_ink" checked /> <span>Local Ink</span></label>
++                <label>Mode: <output id="ink_mode">manual</output></label>
+                 <label>Latency window: <br><input type="range" id="ink_latency" min="0" max="300" step="10"
+                         value="90" /><output>90</output> ms</label>
+                 <label>Thickness: <br><input type="range" id="ink_thickness" min="0.5" max="12" step="0.5"

@@ -1,0 +1,761 @@
+diff --git a/ts/lib.ts b/ts/lib.ts
+index cf3944e..3ac44c5 100644
+--- a/ts/lib.ts
++++ b/ts/lib.ts
+@@ -1,5 +1,9 @@
++/* WebCodecs is missing from the DOM typings of the TypeScript this is built
++ * with (Ubuntu ships 4.8), so its constructors are reached through the window
++ * and left untyped. */
+ interface Window {
+-    ManagedMediaSource: any;
++    VideoDecoder: any;
++    EncodedVideoChunk: any;
+ }
+ 
+ enum LogLevel {
+@@ -15,6 +19,9 @@ let log_level: LogLevel = LogLevel.ERROR;
+ let no_log_messages: boolean = true;
+ 
+ let fps_out: HTMLOutputElement;
++let round_trip_out: HTMLOutputElement;
++// frames actually painted since the last readout, not messages received: a
++// stalled decoder used to be invisible because the messages kept arriving
+ let frame_count = 0;
+ let last_fps_calc: number = performance.now();
+ 
+@@ -26,6 +33,7 @@ function run(level: string) {
+         log_pre.textContent = "";
+         log_level = LogLevel[level];
+         fps_out = document.getElementById("fps") as HTMLOutputElement;
++        round_trip_out = document.getElementById("round_trip") as HTMLOutputElement;
+         check_video = document.getElementById("enable_video") as HTMLInputElement;
+         window.addEventListener("error", (e: ErrorEvent | Event | UIEvent) => {
+             if ((e as ErrorEvent).error) {
+@@ -34,10 +42,7 @@ function run(level: string) {
+             } else if ((e as Event | UIEvent).target) {
+                 let ev = e as Event;
+                 let src = (e.target as any).src;
+-                if (ev.target instanceof HTMLVideoElement)
+-                    log(LogLevel.ERROR, "Failed to decode video, try reducing resolution or disabling hardware acceleration and reload the page. Error src: " + src);
+-                else
+-                    log(LogLevel.ERROR, "Failed to obtain resource, target: " + ev.target + " type: " + ev.type + " src: " + src + " Error object: " + JSON.stringify(ev));
++                log(LogLevel.ERROR, "Failed to obtain resource, target: " + ev.target + " type: " + ev.type + " src: " + src + " Error object: " + JSON.stringify(ev));
+             } else {
+                 log(LogLevel.WARN, "Got unknown event: " + JSON.stringify(e));
+             }
+@@ -116,11 +121,10 @@ class Settings {
+     scale_video_input: HTMLInputElement;
+     scale_video_output: HTMLOutputElement;
+     range_min_pressure: HTMLInputElement;
+-    ink_latency_input: HTMLInputElement;
++    ink_hold_input: HTMLInputElement;
+     ink_thickness_input: HTMLInputElement;
+     ink_color_input: HTMLInputElement;
+     ink_mode_output: HTMLOutputElement;
+-    check_aggressive_seek: HTMLInputElement;
+     client_name_input: HTMLInputElement;
+     visible: boolean;
+     custom_input_areas: CustomInputAreas;
+@@ -137,7 +141,7 @@ class Settings {
+         this.scale_video_input = document.getElementById("scale_video") as HTMLInputElement;
+         this.scale_video_output = this.scale_video_input.nextElementSibling as HTMLOutputElement;
+         this.range_min_pressure = document.getElementById("min_pressure") as HTMLInputElement;
+-        this.ink_latency_input = document.getElementById("ink_latency") as HTMLInputElement;
++        this.ink_hold_input = document.getElementById("ink_hold") as HTMLInputElement;
+         this.ink_thickness_input = document.getElementById("ink_thickness") as HTMLInputElement;
+         this.ink_color_input = document.getElementById("ink_color") as HTMLInputElement;
+         this.ink_mode_output = document.getElementById("ink_mode") as HTMLOutputElement;
+@@ -149,7 +153,7 @@ class Settings {
+             let [w, h] = calc_max_video_resolution(this.scale_video_input.valueAsNumber)
+             this.scale_video_output.value = w + "x" + h
+         }
+-        for (const input of [this.ink_latency_input, this.ink_thickness_input]) {
++        for (const input of [this.ink_hold_input, this.ink_thickness_input]) {
+             input.oninput = () => {
+                 (input.nextElementSibling as HTMLOutputElement).value = input.value;
+             }
+@@ -199,14 +203,9 @@ class Settings {
+             this.save_settings();
+         };
+ 
+-        this.check_aggressive_seek = this.checks.get("aggressive_seeking");
+-        this.check_aggressive_seek.onchange = () => {
+-            this.save_settings();
+-        };
+-
+         this.checks.get("enable_video").onchange = (e) => {
+             let enabled = (e.target as HTMLInputElement).checked;
+-            document.getElementById("video").classList.toggle("vanish", !enabled);
++            document.getElementById("video_canvas").classList.toggle("vanish", !enabled);
+             document.getElementById("canvas").classList.toggle("vanish", enabled);
+             this.save_settings();
+             if (enabled) {
+@@ -236,7 +235,7 @@ class Settings {
+         this.frame_rate_input.onchange = () => this.save_settings();
+         this.range_min_pressure.onchange = () => this.save_settings();
+         this.checks.get("local_ink").onchange = () => this.save_settings();
+-        this.ink_latency_input.onchange = () => this.save_settings();
++        this.ink_hold_input.onchange = () => this.save_settings();
+         this.ink_thickness_input.onchange = () => this.save_settings();
+         this.ink_color_input.onchange = () => this.save_settings();
+ 
+@@ -278,7 +277,7 @@ class Settings {
+         settings["frame_rate"] = frame_rate_scale(this.frame_rate_input.valueAsNumber).toString();
+         settings["scale_video"] = this.scale_video_input.value;
+         settings["min_pressure"] = this.range_min_pressure.value;
+-        settings["ink_latency"] = this.ink_latency_input.value;
++        settings["ink_hold"] = this.ink_hold_input.value;
+         settings["ink_thickness"] = this.ink_thickness_input.value;
+         settings["ink_color"] = this.ink_color_input.value;
+         settings["custom_input_areas"] = this.custom_input_areas;
+@@ -319,14 +318,14 @@ class Settings {
+                 this.range_min_pressure.value = min_pressure;
+ 
+             for (const [key, input] of [
+-                ["ink_latency", this.ink_latency_input],
++                ["ink_hold", this.ink_hold_input],
+                 ["ink_thickness", this.ink_thickness_input],
+                 ["ink_color", this.ink_color_input],
+             ] as [string, HTMLInputElement][]) {
+                 if (settings[key])
+                     input.value = settings[key];
+             }
+-            for (const input of [this.ink_latency_input, this.ink_thickness_input])
++            for (const input of [this.ink_hold_input, this.ink_thickness_input])
+                 (input.nextElementSibling as HTMLOutputElement).value = input.value;
+ 
+             this.custom_input_areas = settings["custom_input_areas"];
+@@ -339,7 +338,7 @@ class Settings {
+                 this.checks.get("enable_video").checked = false;
+                 if (this.checks.get("energysaving").checked)
+                     this.checks.get("enable_video").disabled = true;
+-                document.getElementById("video").classList.add("vanish");
++                document.getElementById("video_canvas").classList.add("vanish");
+                 document.getElementById("canvas").classList.remove("vanish");
+             }
+ 
+@@ -441,6 +440,7 @@ class Settings {
+ 
+ let settings: Settings;
+ let ink_overlay: InkOverlay;
++let video_clock: VideoClock;
+ let debug_overlay: HTMLElement;
+ let last_pointer_data: Object;
+ 
+@@ -742,6 +742,14 @@ const XPP_NO_PRESSURE = -1;                 // Point::NO_PRESSURE
+ // Full scale of the uinput absolute axes the pen events are sent on.
+ const WIRE_ABS_MAX = 65535;
+ 
++/* Fallback for the Echo hold slider, in milliseconds; keep it in step with the
++ * slider's own default. InkOverlay.cutoff says what the hold covers. */
++const INK_HOLD_DEFAULT = 60;
++
++/* Longest a finished stroke goes on being echoed when frames have stopped
++ * arriving and so nothing can retire it. */
++const INK_MAX_HOLD = 5000;
++
+ class InkPoint {
+     // document units (PostScript points), the space Stroke::points lives in
+     x: number;
+@@ -749,7 +757,8 @@ class InkPoint {
+     // stroke diameter at this point, in document units; -1 means "no pressure"
+     z: number;
+     // timestamp of the event that produced the point, on performance.now()'s
+-    // clock, so the trailing window can find the part not yet on the video
++    // clock, so the point can be dropped once a frame proves the video is
++    // showing it
+     t: number;
+ }
+ 
+@@ -797,11 +806,19 @@ class ToolState {
+  * rasterised (the union of one capsule per segment, filled once). Everything
+  * runs in document units; only the final transform maps them to the screen.
+  *
+- * Only the last "Latency window" milliseconds of a stroke are drawn. The older
+- * part has already come back on the video, and drawing over it reads as bolder
+- * ink however exact the geometry is: the video's copy has been through a lossy
+- * encoder and the canvas's has not, and two translucent highlighter passes
+- * genuinely do multiply.
++ * Only the part of a stroke the video has not caught up with yet is drawn.
++ * Drawing over ink the video has already delivered reads as bolder however
++ * exact the geometry is: the video's copy has been through a lossy encoder and
++ * the canvas's has not, and two translucent highlighter passes genuinely do
++ * multiply.
++ *
++ * Which part that is comes from the frames themselves rather than from a fixed
++ * window into the past. Every frame carries the instant it was captured, so a
++ * point is retired only once a frame captured after the server could have drawn
++ * it has actually been painted. When the video stalls the cutoff stalls with
++ * it and the whole stroke keeps being echoed, which is the behaviour a fixed
++ * window cannot have: it retires ink on schedule whether or not the video
++ * arrived, and the missing ink shows as a gap behind the pen.
+  *
+  * The echo is dropped outright at pen-up rather than fading: Xournal++'s shape
+  * recognizer can replace the finished stroke with something else entirely, so
+@@ -820,6 +837,9 @@ class InkOverlay {
+     rect_y: number;
+     rect_w: number;
+     rect_h: number;
++    // capture instant of the newest painted frame, on performance.now()'s
++    // clock; -Infinity until a frame has been painted, which retires nothing
++    last_frame_at: number;
+ 
+     constructor(canvas: HTMLCanvasElement) {
+         this.canvas = canvas;
+@@ -834,6 +854,7 @@ class InkOverlay {
+         this.rect_y = 0;
+         this.rect_w = 0;
+         this.rect_h = 0;
++        this.last_frame_at = -Infinity;
+         this.resize();
+         window.addEventListener("resize", () => this.resize());
+         requestAnimationFrame(() => this.render());
+@@ -861,6 +882,40 @@ class InkOverlay {
+         this.update_mode();
+     }
+ 
++    /* A frame has just been painted; capture_ms is when the server grabbed it,
++     * on the server's clock. Frames can only move the cutoff forwards: a decoder
++     * that hands back an out-of-order frame must not un-retire ink. */
++    on_frame(capture_ms: number) {
++        let offset = video_clock.offset();
++        if (offset === null)
++            return;
++        this.last_frame_at = Math.max(this.last_frame_at, capture_ms + offset);
++    }
++
++    /* Input older than this is on the video already and is no longer echoed.
++     *
++     * The frame shows every input the server had finished drawing when it was
++     * captured, so the cutoff is the frame's capture instant less everything
++     * that stands between an event leaving this page and its ink being on the
++     * server's screen: the trip up the websocket, the input injection, and
++     * Xournal++'s redraw. That is what the Echo hold slider is; it also absorbs
++     * the error in the clock estimate, which leans the same way. */
++    private cutoff(): number {
++        let hold = settings.ink_hold_input.valueAsNumber;
++        if (!isFinite(hold))
++            hold = INK_HOLD_DEFAULT;
++        return this.last_frame_at - hold;
++    }
++
++    /* Age of the newest input the video is believed to be showing: the whole
++     * loop out to the server and back, as far as this page can measure it.
++     * "-" until a frame has been painted. */
++    round_trip(now: number): string {
++        if (!isFinite(this.last_frame_at))
++            return "-";
++        return Math.round(now - this.cutoff()).toString();
++    }
++
+     live(): boolean {
+         return this.tool_state != null && this.capture_width > 0 && this.capture_height > 0;
+     }
+@@ -1199,7 +1254,7 @@ class InkOverlay {
+      * subpath's start, so starting at the centre cuts a wedge out of the
+      * capsule.
+      *
+-     * `from` is the trailing window's first point. Windowing cannot disturb the
++     * `from` is the first point not yet retired. Retiring cannot disturb the
+      * widths: segment i takes its radius from pts[i], so dropping a prefix
+      * leaves every surviving segment on the width it already had. */
+     private static contour(pts: InkPoint[], from: number): Path2D {
+@@ -1232,12 +1287,16 @@ class InkOverlay {
+ 
+     render() {
+         requestAnimationFrame(() => this.render());
+-        let latency = settings.ink_latency_input.valueAsNumber;
+-        if (!isFinite(latency))
+-            latency = 90;
+         let now = performance.now();
+-        if (this.strokes.some((s) => s.done_at != 0 && now - s.done_at > latency))
+-            this.strokes = this.strokes.filter((s) => s.done_at == 0 || now - s.done_at <= latency);
++        let cutoff = this.cutoff();
++        /* A finished stroke is kept until the video has caught up with its last
++         * point, however long that takes. The cap only bites if frames stop
++         * arriving altogether, and then holding on to strokes forever would be
++         * a leak on top of an already broken picture. */
++        let live = (s: InkStroke) => s.done_at == 0
++            || (s.points[s.points.length - 1].t >= cutoff && now - s.done_at <= INK_MAX_HOLD);
++        if (!this.strokes.every(live))
++            this.strokes = this.strokes.filter(live);
+ 
+         let ctx = this.ctx;
+         if (!this.enabled() || this.strokes.length == 0 || this.rect_w <= 0 || this.rect_h <= 0) {
+@@ -1252,7 +1311,6 @@ class InkOverlay {
+         ctx.setTransform(1, 0, 0, 1, 0, 0);
+         ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+         let dpr = window.devicePixelRatio;
+-        let cutoff = now - latency;
+         let drew = false;
+         for (const s of this.strokes) {
+             let pts = s.points;
+@@ -1260,7 +1318,7 @@ class InkOverlay {
+             if (n == 0 || pts[n - 1].t < cutoff)
+                 continue;                   // the video already has all of it
+             // Segment i is still ours while its far end is newer than the
+-            // cutoff, so the window starts one point before the first such
++            // cutoff, so the echo starts one point before the first such
+             // segment and stays attached to the ink already on the video.
+             let from = 0;
+             while (from + 1 < n && pts[from + 1].t < cutoff)
+@@ -1312,7 +1370,7 @@ class PointerHandler {
+     pointerTypes: string[];
+ 
+     constructor(webSocket: WebSocket) {
+-        let video = document.getElementById("video");
++        let video = document.getElementById("video_canvas");
+         let canvas = document.getElementById("canvas");
+         this.webSocket = webSocket;
+         this.pointerTypes = settings.pointer_types();
+@@ -1523,64 +1581,250 @@ function frame_rate_stats() {
+     fps_out.value = fps.toString();
+     frame_count = 0;
+     last_fps_calc = t;
++    if (ink_overlay)
++        round_trip_out.value = ink_overlay.round_trip(t);
+     setTimeout(() => frame_rate_stats(), 1500);
+ }
+ 
++/* One frame per websocket message: a flags byte, then the capture timestamp as
++ * a little-endian u64 of microseconds on the server's monotonic clock, then the
++ * frame's H.264 bytes. */
++const VIDEO_HEADER_LEN = 9;
++const VIDEO_FLAG_KEYFRAME = 1;
++
++/* Maps the server's monotonic clock onto performance.now().
++ *
++ * A frame turns up at (capture + offset + delivery), where delivery is the
++ * encoding, the socket and the network, and is never negative. The smallest
++ * (arrival - capture) seen recently is therefore as close to the offset as this
++ * connection gets without a protocol round trip, and it overstates it by
++ * whatever the quickest delivery cost. Overstating the offset makes the ink
++ * echo retire points early, which is the failure that shows as a gap behind the
++ * pen, so the caller subtracts a margin on top of this.
++ *
++ * Two buckets take turns and the estimate is the smaller of the two, so a
++ * window of one to two bucket lengths is always in play. Rotating them lets the
++ * estimate follow the drift between two machines' monotonic clocks instead of
++ * latching onto one lucky frame for the life of the connection. */
++class VideoClock {
++    private static BUCKET_MS = 5000;
++    private cur: number;
++    private prev: number;
++    private rotate_at: number;
++
++    constructor() {
++        this.cur = Infinity;
++        this.prev = Infinity;
++        this.rotate_at = -Infinity;
++    }
++
++    sample(arrival_ms: number, capture_ms: number) {
++        if (arrival_ms >= this.rotate_at) {
++            this.prev = this.cur;
++            this.cur = Infinity;
++            this.rotate_at = arrival_ms + VideoClock.BUCKET_MS;
++        }
++        this.cur = Math.min(this.cur, arrival_ms - capture_ms);
++    }
++
++    // milliseconds to add to a server timestamp, or null until a frame arrives
++    offset(): number {
++        let o = Math.min(this.cur, this.prev);
++        return isFinite(o) ? o : null;
++    }
++}
++
++/* The codec string a VideoDecoder has to be configured with, read out of the
++ * stream itself. avc1.PPCCLL is the profile, the constraint flags and the
++ * level: the three bytes that follow the NAL header of the sequence parameter
++ * set. The server picks its encoder and its profile at run time, so anything
++ * hardcoded here would be a bug waiting for someone to turn on VAAPI.
++ *
++ * Returns null if the frame carries no SPS. */
++function codec_from_annexb(data: Uint8Array): string {
++    let zeros = 0;
++    for (let i = 0; i + 4 < data.length; i++) {
++        if (data[i] == 0) {
++            zeros++;
++            continue;
++        }
++        // A start code is two or more zero bytes and a one. What follows is the
++        // NAL header, whose low five bits are the type; 7 is the SPS.
++        if (data[i] == 1 && zeros >= 2 && (data[i + 1] & 0x1f) == 7) {
++            let hex = "";
++            for (let j = i + 2; j <= i + 4; j++)
++                hex += data[j].toString(16).padStart(2, "0");
++            return "avc1." + hex.toUpperCase();
++        }
++        zeros = 0;
++    }
++    return null;
++}
++
++/* Decodes the video stream onto a canvas with WebCodecs.
++ *
++ * There is no container and no media element, and that is the point: a media
++ * element is a player, and a player keeps a reserve of frames on purpose so
++ * that playback stays smooth. That reserve was the largest single source of
++ * latency here. A VideoDecoder has no playback clock and nothing that wants to
++ * stay ahead, so a chunk goes in, a frame comes out, and it is painted.
++ *
++ * Decoded frames hold memory on the decoder's side of the fence and the decoder
++ * stops producing once too many are outstanding, so each one is closed the
++ * moment it has been painted. */
++class VideoStream {
++    canvas: HTMLCanvasElement;
++    ctx: CanvasRenderingContext2D;
++    webSocket: WebSocket;
++    decoder: any;
++    // codec string of the SPS the decoder is configured for, and null whenever
++    // there is no decoder, so that rebuilding one is never skipped
++    codec: string;
++    // nothing decodes until the next keyframe
++    need_key: boolean;
++    // performance.now() when the wait for that keyframe started
++    waiting_since: number;
++    // performance.now() of the last RestartVideo, to rate limit it
++    last_restart: number;
++
++    constructor(canvas: HTMLCanvasElement, webSocket: WebSocket) {
++        this.canvas = canvas;
++        // desynchronized lets the browser put painted pixels on the screen
++        // without first composing them with the rest of the page
++        this.ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
++        this.webSocket = webSocket;
++        this.decoder = null;
++        this.codec = null;
++        this.need_key = true;
++        this.waiting_since = performance.now();
++        this.last_restart = 0;
++    }
++
++    /* The server has thrown its encoder away, which it does whenever the
++     * capture size changes. Nothing about the old stream, the frame size
++     * included, can be assumed to carry over. */
++    restart() {
++        this.teardown();
++    }
++
++    on_message(data: ArrayBuffer) {
++        if (data.byteLength <= VIDEO_HEADER_LEN)
++            return;
++        let head = new DataView(data, 0, VIDEO_HEADER_LEN);
++        let is_key = (head.getUint8(0) & VIDEO_FLAG_KEYFRAME) != 0;
++        /* getBigUint64 would pull BigInt arithmetic onto a path that runs once
++         * per frame, and the two halves as plain numbers are exact anyway: the
++         * timestamp counts microseconds since the server started up, and a
++         * double is exact to 2^53 of them. */
++        let ts_us = head.getUint32(1, true) + head.getUint32(5, true) * 4294967296;
++        let frame = new Uint8Array(data, VIDEO_HEADER_LEN);
++
++        // Sampled on arrival rather than after decoding: the offset wanted is
++        // between the two clocks, and time spent decoding would inflate it.
++        video_clock.sample(performance.now(), ts_us / 1000);
++
++        if (is_key) {
++            let codec = codec_from_annexb(frame);
++            if (codec && codec != this.codec)
++                this.configure(codec);
++        }
++        if (!this.decoder || this.decoder.state != "configured" || (this.need_key && !is_key)) {
++            /* Frames are arriving that cannot be used. Keyframes of their own
++             * accord are seconds apart, but a new encoder opens with one, so
++             * asking the server for one is the quick way out. */
++            if (performance.now() - this.waiting_since > 3000)
++                this.request_restart();
++            return;
++        }
++        this.need_key = false;
++        this.decoder.decode(new window.EncodedVideoChunk({
++            type: is_key ? "key" : "delta",
++            timestamp: ts_us,
++            data: frame,
++        }));
++    }
++
++    private paint(frame: any) {
++        try {
++            if (this.canvas.width != frame.displayWidth
++                || this.canvas.height != frame.displayHeight) {
++                // The canvas's pixel size is what the page lays the element out
++                // from, so changing it means refitting it to the window.
++                this.canvas.width = frame.displayWidth;
++                this.canvas.height = frame.displayHeight;
++                stretch_video();
++            }
++            this.ctx.drawImage(frame, 0, 0);
++            frame_count += 1;
++            // The decoder carries the chunk's timestamp through to the frame,
++            // so this is the instant the server grabbed these very pixels.
++            if (ink_overlay)
++                ink_overlay.on_frame(frame.timestamp / 1000);
++        } finally {
++            frame.close();
++        }
++    }
++
++    private configure(codec: string) {
++        this.teardown();
++        try {
++            this.decoder = new window.VideoDecoder({
++                output: (frame: any) => this.paint(frame),
++                error: (err: any) => {
++                    // The codec string belongs in the message: it is read out
++                    // of the stream, so a decoder that will not take it says
++                    // something about what the server chose to encode.
++                    log(LogLevel.WARN, "Video decoder for " + codec + " failed: " + err);
++                    this.teardown();
++                    this.request_restart();
++                },
++            });
++            /* No description, which the WebCodecs AVC registration reads as
++             * "the chunks are Annex-B", and they are. The frame size is left
++             * out too; it is in the SPS the decoder is about to be handed. */
++            this.decoder.configure({ codec: codec, optimizeForLatency: true });
++            this.codec = codec;
++        } catch (err) {
++            log(LogLevel.ERROR, "Failed to configure video decoder for " + codec + ": " + err);
++            this.teardown();
++        }
++    }
++
++    private teardown() {
++        if (this.decoder) {
++            if (this.decoder.state != "closed")
++                this.decoder.close();
++            this.decoder = null;
++        }
++        this.codec = null;
++        this.need_key = true;
++        this.waiting_since = performance.now();
++    }
++
++    /* Rate limited so that a decoder failing on every frame cannot turn into a
++     * restart loop. */
++    private request_restart() {
++        let now = performance.now();
++        if (now - this.last_restart < 5000)
++            return;
++        this.last_restart = now;
++        this.webSocket.send('"RestartVideo"');
++    }
++}
++
+ function handle_messages(
+     webSocket: WebSocket,
+-    video: HTMLVideoElement,
++    stream: VideoStream,
+     onConfigOk: Function,
+     onConfigError: Function,
+     onCapturableList: Function,
+ ) {
+-    let mediaSource: MediaSource = null;
+-    let sourceBuffer: SourceBuffer = null;
+-    let queue = [];
+-    const MAX_BUFFER_LENGTH = 20;  // In seconds
+-    function upd_buf() {
+-        if (sourceBuffer == null)
+-            return;
+-        if (!sourceBuffer.updating && queue.length > 0 && mediaSource.readyState == "open") {
+-            let buffer_length = 0;
+-            if (sourceBuffer.buffered.length) {
+-                // Assume only one time range...
+-                buffer_length = sourceBuffer.buffered.end(0) - sourceBuffer.buffered.start(0);
+-            }
+-            if (buffer_length > MAX_BUFFER_LENGTH) {
+-                sourceBuffer.remove(0, sourceBuffer.buffered.end(0) - MAX_BUFFER_LENGTH / 2);
+-                // This will trigger updateend when finished
+-            } else {
+-                try {
+-                    sourceBuffer.appendBuffer(queue.shift());
+-                } catch (err) {
+-                    log(LogLevel.DEBUG, "Error appending to sourceBuffer:" + err);
+-                    // Drop everything, and try to pick up the stream again
+-                    if (sourceBuffer.updating)
+-                        sourceBuffer.abort();
+-                    sourceBuffer.remove(0, Infinity);
+-                }
+-            }
+-        }
+-    }
+     webSocket.onmessage = (event: MessageEvent) => {
+         if (typeof event.data == "string") {
+             let msg = JSON.parse(event.data);
+             if (typeof msg == "string") {
+                 if (msg == "NewVideo") {
+-                    let MS = window.ManagedMediaSource ? window.ManagedMediaSource : window.MediaSource;
+-                    mediaSource = new MS();
+-                    sourceBuffer = null;
+-                    video.src = URL.createObjectURL(mediaSource);
+-                    mediaSource.addEventListener("sourceopen", (_) => {
+-                        let mimeType = 'video/mp4; codecs="avc1.4D403D"';
+-                        if (!MS.isTypeSupported(mimeType))
+-                            mimeType = "video/mp4";
+-                        sourceBuffer = mediaSource.addSourceBuffer(mimeType);
+-                        sourceBuffer.addEventListener("updateend", upd_buf);
+-                        // try to recover from errors by restarting the video
+-                        if (sourceBuffer.onerror)
+-                            sourceBuffer.onerror = () => settings.send_server_config();
+-                    })
++                    stream.restart();
+                 } else if (msg == "ConfigOk") {
+                     onConfigOk();
+                 }
+@@ -1608,31 +1852,15 @@ function handle_messages(
+         }
+ 
+         // not a string -> got a video frame
+-        queue.push(event.data);
+-        upd_buf();
+-        frame_count += 1;
+-
+-        // only seek if there is data available, some browsers choke otherwise
+-        if (video.seekable.length > 0) {
+-            let seek_time = video.seekable.end(video.seekable.length - 1);
+-            if (video.readyState >= (settings.check_aggressive_seek.checked ? 3 : 4)
+-                // but make sure to catch up if the video is more than 3 seconds behind
+-                || seek_time - video.currentTime > 3) {
+-                if (isFinite(seek_time))
+-                    video.currentTime = seek_time;
+-                else
+-                    log(LogLevel.WARN, "Failed to seek to end of video.")
+-            }
+-
+-        }
++        stream.on_message(event.data);
+     }
+ }
+ 
+ function check_apis() {
+     let apis = [
+         {
+-            attrs: ["MediaSource", "ManagedMediaSource"],
+-            msg: "This browser doesn't support MSE/MMS required to playback video stream, try upgrading!"
++            attrs: ["VideoDecoder"],
++            msg: "This browser doesn't support WebCodecs required to decode the video stream, try upgrading!"
+         },
+         {
+             attrs: ["PointerEvent"],
+@@ -1664,9 +1892,11 @@ function init() {
+     debug_overlay = document.getElementById("debug_overlay");
+     settings = new Settings(webSocket);
+ 
+-    let video = document.getElementById("video") as HTMLVideoElement;
++    let video = document.getElementById("video_canvas") as HTMLCanvasElement;
+     let canvas = document.getElementById("canvas") as HTMLCanvasElement;
++    video_clock = new VideoClock();
+     ink_overlay = new InkOverlay(document.getElementById("ink_canvas") as HTMLCanvasElement);
++    let stream = new VideoStream(video, webSocket);
+ 
+     video.oncontextmenu = function(event) {
+         event.preventDefault();
+@@ -1712,11 +1942,8 @@ function init() {
+         settings.scale_video_output.value = w + "x" + h;
+         settings.send_server_config();
+     }
+-    video.controls = false;
+-    video.disableRemotePlayback = true;
+-    video.onloadeddata = () => stretch_video();
+     let is_connected = false;
+-    handle_messages(webSocket, video, () => {
++    handle_messages(webSocket, stream, () => {
+         if (!is_connected) {
+             new KeyboardHandler(webSocket);
+             new PointerHandler(webSocket);
+@@ -1748,7 +1975,7 @@ function init() {
+ // object-fit: fill; <-- this is unfortunately not supported on iOS, so we use the following
+ // workaround
+ function stretch_video() {
+-    let video = document.getElementById("video") as HTMLVideoElement;
++    let video = document.getElementById("video_canvas") as HTMLCanvasElement;
+     if (settings.stretched_video()) {
+         video.style.transform = "scaleX(" + document.body.clientWidth / video.clientWidth + ") scaleY(" + document.body.clientHeight / video.clientHeight + ")";
+     } else {
+diff --git a/www/static/style.css b/www/static/style.css
+index fc4bb01..05f523e 100644
+--- a/www/static/style.css
++++ b/www/static/style.css
+@@ -31,7 +31,16 @@ body, html, main {
+     color: var(--color);
+     background: var(--background-color-2);
+ }
+-video {
++canvas {
++    position: absolute;
++    width: 100%;
++    height: 100%;
++}
++/* The video canvas is laid out from its own pixel size, the way the <video>
++ * element it replaced was laid out from the stream's, so that stretch_video's
++ * transform has an aspect-correct box to scale. */
++#video_canvas {
++    position: static;
+     max-width: 100%;
+     max-height: 100%;
+     width: auto;
+@@ -39,11 +48,6 @@ video {
+     display: block;
+     margin: auto auto;
+ }
+-canvas {
+-    position: absolute;
+-    width: 100%;
+-    height: 100%;
+-}
+ #ink_canvas {
+     top: 0;
+     left: 0;
+@@ -116,7 +120,7 @@ input[type='range']::-webkit-slider-runnable-track, input[type="range"]::-moz-ra
+     right: -1em;
+     border-radius: 0 0 0.25em 0;
+ }
+-.vanish #handle, video.vanish, canvas.vanish {
++.vanish #handle, canvas.vanish {
+     display: none !important;
+ }
+ #settings h2 {
+diff --git a/www/templates/index.html b/www/templates/index.html
+index 1bcf3ea..6849e82 100644
+--- a/www/templates/index.html
++++ b/www/templates/index.html
+@@ -16,7 +16,7 @@
+ 
+ <body>
+     <main id="main">
+-        <video id="video" autoplay muted defaultMuted playsinline disablePictureInPicture></video>
++        <canvas id="video_canvas" width="16" height="9"></canvas>
+         <canvas id="canvas" class="vanish"></canvas>
+         <canvas id="ink_canvas"></canvas>
+         <div id="debug_overlay" class="hide"></div>
+@@ -41,8 +41,6 @@
+                     <input type="checkbox" id="capture_cursor" />
+                     <span>Capture Cursor</span>
+                 </label>
+-                <label><input type="checkbox" id="aggressive_seeking" checked /> <span>Lower Latency<br>(possibly
+-                        choppy)</span></label>
+                 <label>Max Video Resolution: <br><input type="range" id="scale_video" min="0.1" max="2" step="0.01"
+                         value="1.8" /><output></output></label>
+                 <label>Frame Rate: <br><input type="range" id="frame_rate" value="0" /><output>30</output> fps</label>
+@@ -68,8 +66,8 @@
+             <section>
+                 <label><input type="checkbox" id="local_ink" checked /> <span>Local Ink</span></label>
+                 <label>Mode: <output id="ink_mode">manual</output></label>
+-                <label>Latency window: <br><input type="range" id="ink_latency" min="0" max="300" step="10"
+-                        value="90" /><output>90</output> ms</label>
++                <label>Echo hold: <br><input type="range" id="ink_hold" min="0" max="200" step="5"
++                        value="60" /><output>60</output> ms</label>
+                 <label>Thickness: <br><input type="range" id="ink_thickness" min="0.5" max="12" step="0.5"
+                         value="3" /><output>3</output> px</label>
+                 <label>Color: <input type="color" id="ink_color" value="#000000" /></label>
+@@ -83,7 +81,8 @@
+                 <label id="vanish">Hide until Reload</label>
+             </section>
+             <section id="stats_section">
+-                <label><span>FPS (receiving): </span><output id="fps">0</output></label>
++                <label><span>FPS (painted): </span><output id="fps">0</output></label>
++                <label><span>Round trip: </span><output id="round_trip">-</output> ms</label>
+             </section>
+             <section id="debug_section">
+                 <label><input type="checkbox" id="enable_debug_overlay" /> <span>Debug

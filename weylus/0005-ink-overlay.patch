@@ -1,0 +1,319 @@
+diff --git a/ts/lib.ts b/ts/lib.ts
+index a44b229..e2229d9 100644
+--- a/ts/lib.ts
++++ b/ts/lib.ts
+@@ -116,6 +116,9 @@ class Settings {
+     scale_video_input: HTMLInputElement;
+     scale_video_output: HTMLOutputElement;
+     range_min_pressure: HTMLInputElement;
++    ink_latency_input: HTMLInputElement;
++    ink_thickness_input: HTMLInputElement;
++    ink_color_input: HTMLInputElement;
+     check_aggressive_seek: HTMLInputElement;
+     client_name_input: HTMLInputElement;
+     visible: boolean;
+@@ -133,6 +136,9 @@ class Settings {
+         this.scale_video_input = document.getElementById("scale_video") as HTMLInputElement;
+         this.scale_video_output = this.scale_video_input.nextElementSibling as HTMLOutputElement;
+         this.range_min_pressure = document.getElementById("min_pressure") as HTMLInputElement;
++        this.ink_latency_input = document.getElementById("ink_latency") as HTMLInputElement;
++        this.ink_thickness_input = document.getElementById("ink_thickness") as HTMLInputElement;
++        this.ink_color_input = document.getElementById("ink_color") as HTMLInputElement;
+         this.client_name_input = document.getElementById("client_name") as HTMLInputElement;
+         this.frame_rate_input.oninput = () => {
+             this.frame_rate_output.value = Math.round(frame_rate_scale(this.frame_rate_input.valueAsNumber)).toString();
+@@ -141,6 +147,11 @@ class Settings {
+             let [w, h] = calc_max_video_resolution(this.scale_video_input.valueAsNumber)
+             this.scale_video_output.value = w + "x" + h
+         }
++        for (const input of [this.ink_latency_input, this.ink_thickness_input]) {
++            input.oninput = () => {
++                (input.nextElementSibling as HTMLOutputElement).value = input.value;
++            }
++        }
+         this.visible = true;
+ 
+         // Settings UI
+@@ -222,6 +233,10 @@ class Settings {
+ 
+         this.frame_rate_input.onchange = () => this.save_settings();
+         this.range_min_pressure.onchange = () => this.save_settings();
++        this.checks.get("local_ink").onchange = () => this.save_settings();
++        this.ink_latency_input.onchange = () => this.save_settings();
++        this.ink_thickness_input.onchange = () => this.save_settings();
++        this.ink_color_input.onchange = () => this.save_settings();
+ 
+         // server
+         let upd_server_config = () => { this.save_settings(); this.send_server_config() };
+@@ -261,6 +276,9 @@ class Settings {
+         settings["frame_rate"] = frame_rate_scale(this.frame_rate_input.valueAsNumber).toString();
+         settings["scale_video"] = this.scale_video_input.value;
+         settings["min_pressure"] = this.range_min_pressure.value;
++        settings["ink_latency"] = this.ink_latency_input.value;
++        settings["ink_thickness"] = this.ink_thickness_input.value;
++        settings["ink_color"] = this.ink_color_input.value;
+         settings["custom_input_areas"] = this.custom_input_areas;
+         settings["client_name"] = this.client_name_input.value;
+         localStorage.setItem("settings", JSON.stringify(settings));
+@@ -298,6 +316,17 @@ class Settings {
+             if (min_pressure)
+                 this.range_min_pressure.value = min_pressure;
+ 
++            for (const [key, input] of [
++                ["ink_latency", this.ink_latency_input],
++                ["ink_thickness", this.ink_thickness_input],
++                ["ink_color", this.ink_color_input],
++            ] as [string, HTMLInputElement][]) {
++                if (settings[key])
++                    input.value = settings[key];
++            }
++            for (const input of [this.ink_latency_input, this.ink_thickness_input])
++                (input.nextElementSibling as HTMLOutputElement).value = input.value;
++
+             this.custom_input_areas = settings["custom_input_areas"];
+ 
+             if (this.checks.get("lefty").checked) {
+@@ -400,6 +429,7 @@ class Settings {
+ }
+ 
+ let settings: Settings;
++let ink_overlay: InkOverlay;
+ let debug_overlay: HTMLElement;
+ let last_pointer_data: Object;
+ 
+@@ -686,6 +716,174 @@ class Painter {
+     }
+ }
+ 
++class InkPoint {
++    x: number;
++    y: number;
++    // stroke width in CSS pixels, already scaled by pressure
++    w: number;
++    t: number;
++}
++
++class InkStroke {
++    points: InkPoint[] = [];
++}
++
++/* Echoes pen input on a transparent canvas above the video while the real ink
++ * makes the round trip through the server. Only the trailing "Latency window"
++ * milliseconds of each stroke are drawn; older parts are assumed to be visible
++ * in the video underneath, so the tail simply runs out and no retire event is
++ * needed. The stroke geometry imitates Xournal++'s pen rendering so the echo
++ * and the video ink line up. */
++class InkOverlay {
++    canvas: HTMLCanvasElement;
++    ctx: CanvasRenderingContext2D;
++    strokes: InkStroke[];
++    active: Map<number, InkStroke>;
++    // per-pointer [x, y, pressure] input history for the stabilizer
++    raw: Map<number, [number, number, number][]>;
++    was_clear: boolean;
++
++    constructor(canvas: HTMLCanvasElement) {
++        this.canvas = canvas;
++        this.ctx = canvas.getContext("2d");
++        this.strokes = [];
++        this.active = new Map();
++        this.raw = new Map();
++        this.was_clear = true;
++        this.resize();
++        window.addEventListener("resize", () => this.resize());
++        requestAnimationFrame(() => this.render());
++    }
++
++    resize() {
++        this.canvas.width = window.innerWidth * window.devicePixelRatio;
++        this.canvas.height = window.innerHeight * window.devicePixelRatio;
++    }
++
++    enabled(): boolean {
++        return check_video.checked && settings.checks.get("local_ink").checked;
++    }
++
++    feed(event_type: string, event: PointerEvent) {
++        let id = event.pointerId;
++        // No cleanup on pointerup is required for correctness, the tail ages
++        // out regardless; dropping the state here merely frees it early and
++        // separates strokes of a reused pointer id.
++        if (event_type != "pointerdown" && event_type != "pointermove") {
++            this.active.delete(id);
++            this.raw.delete(id);
++            return;
++        }
++        if (!this.enabled())
++            return;
++        // Only the pen tip and the left mouse button leave ink: the barrel
++        // button and the eraser tip make Xournal++ switch tools.
++        if (event.buttons != 1 || (event.pointerType != "pen" && event.pointerType != "mouse")) {
++            this.active.delete(id);
++            this.raw.delete(id);
++            return;
++        }
++
++        let pressure = Math.max(event.pressure, settings.range_min_pressure.valueAsNumber);
++        // Xournal++'s pressure pipeline with the settings used on the server:
++        // minimumPressure = 0.09, pressureMultiplier = 1.6 (PenInputHandler).
++        pressure = Math.max(0.09, pressure * 1.6);
++
++        let buf = this.raw.get(id);
++        let stroke = this.active.get(id);
++        if (event_type == "pointerdown" || !buf || !stroke) {
++            buf = [];
++            this.raw.set(id, buf);
++            stroke = new InkStroke();
++            this.strokes.push(stroke);
++            this.active.set(id, stroke);
++        }
++        // Arithmetic mean of the last 3 points including pressure, matching
++        // Xournal++'s stabilizer settings on the server (StrokeStabilizer).
++        buf.push([event.clientX, event.clientY, pressure]);
++        if (buf.length > 3)
++            buf.shift();
++        let x = 0, y = 0, p = 0;
++        for (const [bx, by, bp] of buf) {
++            x += bx;
++            y += by;
++            p += bp;
++        }
++        let n = buf.length;
++        stroke.points.push({
++            x: x / n,
++            y: y / n,
++            w: p / n * settings.ink_thickness_input.valueAsNumber,
++            t: event.timeStamp,
++        });
++    }
++
++    render() {
++        requestAnimationFrame(() => this.render());
++        let latency = settings.ink_latency_input.valueAsNumber;
++        if (!isFinite(latency))
++            latency = 90;
++        let cutoff = performance.now() - latency;
++        for (const stroke of this.strokes) {
++            let pts = stroke.points;
++            // keep one point beyond the cutoff so the tail stays attached to
++            // the ink that has already reached the video
++            while (pts.length >= 2 && pts[1].t < cutoff)
++                pts.shift();
++            if (pts.length == 1 && pts[0].t < cutoff)
++                pts.shift();
++        }
++        if (this.strokes.some((s) => s.points.length == 0)) {
++            let live = new Set(this.active.values());
++            this.strokes = this.strokes.filter((s) => s.points.length > 0 || live.has(s));
++        }
++
++        let ctx = this.ctx;
++        if (!this.enabled() || !this.strokes.some((s) => s.points.length > 1)) {
++            if (!this.was_clear) {
++                ctx.setTransform(1, 0, 0, 1, 0, 0);
++                ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
++                this.was_clear = true;
++            }
++            return;
++        }
++
++        ctx.setTransform(1, 0, 0, 1, 0, 0);
++        ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
++        // draw in CSS pixels on the devicePixelRatio-scaled backing store
++        let dpr = window.devicePixelRatio;
++        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
++        ctx.lineCap = "round";
++        ctx.lineJoin = "round";
++        ctx.strokeStyle = settings.ink_color_input.value;
++        // ramp alpha over the older half of the window so the handoff to the
++        // video ink has no visible seam
++        let fade = Math.max(1, latency / 2);
++        for (const stroke of this.strokes) {
++            let pts = stroke.points;
++            for (let i = 1; i < pts.length; i++) {
++                let a = pts[i - 1];
++                let b = pts[i];
++                // alpha from the newer endpoint, so the segment straddling the
++                // cutoff is still drawn (faintly) and the tail has no gap
++                let alpha = Math.min(1, (b.t - cutoff) / fade);
++                if (alpha <= 0)
++                    continue;
++                // one stroke() per segment with the width of its first point,
++                // the way Xournal++ renders pressure-varying strokes
++                ctx.globalAlpha = alpha;
++                ctx.lineWidth = a.w;
++                ctx.beginPath();
++                ctx.moveTo(a.x, a.y);
++                ctx.lineTo(b.x, b.y);
++                ctx.stroke();
++            }
++        }
++        ctx.globalAlpha = 1;
++        this.was_clear = false;
++    }
++}
++
+ class PointerHandler {
+     webSocket: WebSocket;
+     pointerTypes: string[];
+@@ -806,6 +1004,8 @@ class PointerHandler {
+             let rect = (event.target as HTMLElement).getBoundingClientRect();
+             const events = event_type === "pointermove" && typeof event.getCoalescedEvents === 'function' ? event.getCoalescedEvents() : [event];
+             for (let event of events) {
++                if (ink_overlay)
++                    ink_overlay.feed(event_type, event);
+                 this.webSocket.send(
+                     JSON.stringify(
+                         {
+@@ -1041,6 +1241,7 @@ function init() {
+ 
+     let video = document.getElementById("video") as HTMLVideoElement;
+     let canvas = document.getElementById("canvas") as HTMLCanvasElement;
++    ink_overlay = new InkOverlay(document.getElementById("ink_canvas") as HTMLCanvasElement);
+ 
+     video.oncontextmenu = function(event) {
+         event.preventDefault();
+diff --git a/www/static/style.css b/www/static/style.css
+index 41d48cb..fc4bb01 100644
+--- a/www/static/style.css
++++ b/www/static/style.css
+@@ -44,6 +44,11 @@ canvas {
+     width: 100%;
+     height: 100%;
+ }
++#ink_canvas {
++    top: 0;
++    left: 0;
++    pointer-events: none;
++}
+ input[type='text'] {
+     touch-action: auto !important;
+     user-select: text;
+diff --git a/www/templates/index.html b/www/templates/index.html
+index 17ab93a..8c7cd2d 100644
+--- a/www/templates/index.html
++++ b/www/templates/index.html
+@@ -18,6 +18,7 @@
+     <main id="main">
+         <video id="video" autoplay muted defaultMuted playsinline disablePictureInPicture></video>
+         <canvas id="canvas" class="vanish"></canvas>
++        <canvas id="ink_canvas"></canvas>
+         <div id="debug_overlay" class="hide"></div>
+     </main>
+     <div id="settings">
+@@ -63,6 +64,15 @@
+                         id="enable_custom_input_areas" /> <span>Enable Custom Input
+                         Area</span></label>
+             </section>
++            <h3>Local Ink</h3>
++            <section>
++                <label><input type="checkbox" id="local_ink" checked /> <span>Local Ink</span></label>
++                <label>Latency window: <br><input type="range" id="ink_latency" min="0" max="300" step="10"
++                        value="90" /><output>90</output> ms</label>
++                <label>Thickness: <br><input type="range" id="ink_thickness" min="0.5" max="12" step="0.5"
++                        value="3" /><output>3</output> px</label>
++                <label>Color: <input type="color" id="ink_color" value="#000000" /></label>
++            </section>
+             <section {{#if (not uinput_enabled)}}class="hide" {{/if}}>
+                 <label><span>Client Name:</span><br><input type="text" id="client_name" /><br><span>Optional, useful to
+                         distinguish multiple devices.</span></label>

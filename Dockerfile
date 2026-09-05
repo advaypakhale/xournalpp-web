@@ -16,6 +16,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 RUN git clone https://github.com/advaypakhale/xournalpp.git /src \
     && git -C /src checkout --detach "$XOURNALPP_REF"
 WORKDIR /src
+COPY xournalpp/ /patches/
+RUN for p in /patches/*.patch; do git apply --verbose "$p"; done
 RUN cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
     && ninja -C build \
     && DESTDIR=/out ninja -C build install

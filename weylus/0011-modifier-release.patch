@@ -1,0 +1,286 @@
+diff --git a/src/input/device.rs b/src/input/device.rs
+index 920406e..8751f7c 100644
+--- a/src/input/device.rs
++++ b/src/input/device.rs
+@@ -15,4 +15,8 @@ pub trait InputDevice {
+     fn send_keyboard_event(&mut self, event: &KeyboardEvent);
+     fn set_capturable(&mut self, capturable: Box<dyn Capturable>);
+     fn device_type(&self) -> InputDeviceType;
++
++    /// Release every key this device is still holding down for the client that owns it, so a
++    /// client that vanishes without sending its key up events cannot leave the keyboard latched.
++    fn release_keys(&mut self) {}
+ }
+diff --git a/src/input/uinput_device.rs b/src/input/uinput_device.rs
+index 9cfa37d..0c32428 100644
+--- a/src/input/uinput_device.rs
++++ b/src/input/uinput_device.rs
+@@ -1,6 +1,8 @@
+ use std::cmp::Ordering;
++use std::collections::HashMap;
+ use std::ffi::CString;
+ use std::os::raw::{c_char, c_int};
++use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+ use std::sync::{Arc, Mutex};
+ use std::time::{Duration, Instant};
+ 
+@@ -48,8 +50,13 @@ pub struct UInputDevice {
+     num_stylus_mapping_tries: usize,
+     num_touch_mapping_tries: usize,
+     x11ctx: Option<X11Context>,
++    keys_down: HashMap<c_int, u64>,
++    key_owner: u64,
+ }
+ 
++/// Owner id for a device that is not shared, where every key belongs to the one client using it.
++const OWNER_EXCLUSIVE: u64 = 0;
++
+ impl UInputDevice {
+     pub fn new(
+         capturable: Option<Box<dyn Capturable>>,
+@@ -117,6 +124,8 @@ impl UInputDevice {
+             num_stylus_mapping_tries: 0,
+             num_touch_mapping_tries: 0,
+             x11ctx: X11Context::new(),
++            keys_down: HashMap::new(),
++            key_owner: OWNER_EXCLUSIVE,
+         })
+     }
+ 
+@@ -183,6 +192,39 @@ impl UInputDevice {
+         }
+         self.stylus_buttons = desired;
+     }
++
++    // Every keyboard key press and release goes through here so `keys_down` stays an accurate
++    // record of what the virtual keyboard holds and of which client asked for it.
++    fn send_key(&mut self, code: c_int, state: c_int) {
++        self.send(self.keyboard_fd, ET_KEY, code, state);
++        self.send(self.keyboard_fd, ET_SYNC, EC_SYNC_REPORT, 0);
++        if state == 0 {
++            self.keys_down.remove(&code);
++        } else {
++            self.keys_down.insert(code, self.key_owner);
++        }
++    }
++
++    /// Send a keyboard event, attributing whatever it presses to `owner`.
++    pub fn send_keyboard_event_as(&mut self, event: &KeyboardEvent, owner: u64) {
++        self.key_owner = owner;
++        InputDevice::send_keyboard_event(self, event);
++    }
++
++    /// Release the keys `owner` still holds down. Keys pressed by another client are left alone:
++    /// this device outlives any single client and may be in use by one right now.
++    pub fn release_keys_of(&mut self, owner: u64) {
++        let held = self
++            .keys_down
++            .iter()
++            .filter(|(_, o)| **o == owner)
++            .map(|(code, _)| *code)
++            .collect::<Vec<_>>();
++        for code in held {
++            debug!("Releasing key {} left held by a client that went away.", code);
++            self.send_key(code, 0);
++        }
++    }
+ }
+ 
+ impl Drop for UInputDevice {
+@@ -939,24 +981,19 @@ impl InputDevice for UInputDevice {
+         }
+ 
+         if event.ctrl {
+-            self.send(self.keyboard_fd, ET_KEY, KEY_LEFTCTRL, state);
+-            self.send(self.keyboard_fd, ET_SYNC, EC_SYNC_REPORT, 0);
++            self.send_key(KEY_LEFTCTRL, state);
+         }
+         if event.alt {
+-            self.send(self.keyboard_fd, ET_KEY, KEY_LEFTALT, state);
+-            self.send(self.keyboard_fd, ET_SYNC, EC_SYNC_REPORT, 0);
++            self.send_key(KEY_LEFTALT, state);
+         }
+         if event.meta {
+-            self.send(self.keyboard_fd, ET_KEY, KEY_LEFTMETA, state);
+-            self.send(self.keyboard_fd, ET_SYNC, EC_SYNC_REPORT, 0);
++            self.send_key(KEY_LEFTMETA, state);
+         }
+         if event.shift {
+-            self.send(self.keyboard_fd, ET_KEY, KEY_LEFTSHIFT, state);
+-            self.send(self.keyboard_fd, ET_SYNC, EC_SYNC_REPORT, 0);
++            self.send_key(KEY_LEFTSHIFT, state);
+         }
+ 
+-        self.send(self.keyboard_fd, ET_KEY, key_code, state);
+-        self.send(self.keyboard_fd, ET_SYNC, EC_SYNC_REPORT, 0);
++        self.send_key(key_code, state);
+     }
+ 
+     fn set_capturable(&mut self, capturable: Box<dyn Capturable>) {
+@@ -966,6 +1003,10 @@ impl InputDevice for UInputDevice {
+     fn device_type(&self) -> InputDeviceType {
+         InputDeviceType::UInputDevice
+     }
++
++    fn release_keys(&mut self) {
++        self.release_keys_of(OWNER_EXCLUSIVE);
++    }
+ }
+ 
+ // The X display and capturable inside are only ever used by the thread holding the mutex in
+@@ -973,26 +1014,47 @@ impl InputDevice for UInputDevice {
+ unsafe impl Send for UInputDevice {}
+ 
+ /// One set of uinput devices used by every client, created before any client connects.
+-pub struct SharedUInputDevice(pub Arc<Mutex<UInputDevice>>);
++pub struct SharedUInputDevice {
++    device: Arc<Mutex<UInputDevice>>,
++    /// Tells this client's key presses apart from those of the other clients sharing the device.
++    owner: u64,
++}
++
++impl SharedUInputDevice {
++    pub fn new(device: Arc<Mutex<UInputDevice>>) -> Self {
++        static NEXT_OWNER: AtomicU64 = AtomicU64::new(OWNER_EXCLUSIVE + 1);
++        Self {
++            device,
++            owner: NEXT_OWNER.fetch_add(1, AtomicOrdering::Relaxed),
++        }
++    }
++}
+ 
+ impl InputDevice for SharedUInputDevice {
+     fn send_wheel_event(&mut self, event: &WheelEvent) {
+-        self.0.lock().unwrap().send_wheel_event(event)
++        self.device.lock().unwrap().send_wheel_event(event)
+     }
+ 
+     fn send_pointer_event(&mut self, event: &PointerEvent) {
+-        self.0.lock().unwrap().send_pointer_event(event)
++        self.device.lock().unwrap().send_pointer_event(event)
+     }
+ 
+     fn send_keyboard_event(&mut self, event: &KeyboardEvent) {
+-        self.0.lock().unwrap().send_keyboard_event(event)
++        self.device
++            .lock()
++            .unwrap()
++            .send_keyboard_event_as(event, self.owner)
+     }
+ 
+     fn set_capturable(&mut self, capturable: Box<dyn Capturable>) {
+-        self.0.lock().unwrap().set_capturable(capturable)
++        self.device.lock().unwrap().set_capturable(capturable)
+     }
+ 
+     fn device_type(&self) -> InputDeviceType {
+         InputDeviceType::UInputDevice
+     }
++
++    fn release_keys(&mut self) {
++        self.device.lock().unwrap().release_keys_of(self.owner)
++    }
+ }
+diff --git a/src/websocket.rs b/src/websocket.rs
+index 13f1696..01f9af6 100644
+--- a/src/websocket.rs
++++ b/src/websocket.rs
+@@ -152,6 +152,12 @@ impl<S, R, FnUInput> WeylusClientHandler<S, R, FnUInput> {
+             }
+         }
+ 
++        // A client that closes or crashes mid-shortcut never sends the matching key up events, so
++        // release whatever it left held before the next client arrives.
++        if let Some(device) = self.input_device.as_mut() {
++            device.release_keys();
++        }
++
+         drop(self.video_sender);
+         if let Err(err) = self.video_thread.join() {
+             warn!("Failed to join video thread: {err:?}");
+@@ -237,7 +243,7 @@ impl<S, R, FnUInput> WeylusClientHandler<S, R, FnUInput> {
+                         d.device_type() != InputDeviceType::UInputDevice
+                     }) {
+                         self.input_device = Some(Box::new(
+-                            crate::input::uinput_device::SharedUInputDevice(shared.clone()),
++                            crate::input::uinput_device::SharedUInputDevice::new(shared.clone()),
+                         ));
+                     }
+                     if let Some(d) = self.input_device.as_mut() {
+diff --git a/ts/lib.ts b/ts/lib.ts
+index 3ac44c5..dcbb821 100644
+--- a/ts/lib.ts
++++ b/ts/lib.ts
+@@ -1526,10 +1526,20 @@ class KEvent {
+         this.shift = event.shiftKey;
+         this.meta = event.metaKey;
+     }
++
++    // A key up carrying no modifier flags, so the server releases this key and nothing alongside
++    // it. The location has to be carried over: it is what tells a numpad key from its main-block
++    // twin, and releasing the twin would leave the real key down.
++    static release(code: string, location: number): KEvent {
++        return new KEvent("up", new KeyboardEvent("keyup", { code: code, location: location }));
++    }
+ }
+ 
+ class KeyboardHandler {
+     webSocket: WebSocket;
++    // Key up events the server needs to get back to a released keyboard, by KeyboardEvent.code, in
++    // the order the keys went down.
++    keys_down: Map<string, KEvent> = new Map();
+ 
+     constructor(webSocket: WebSocket) {
+         this.webSocket = webSocket;
+@@ -1565,14 +1575,51 @@ class KeyboardHandler {
+             e.stopPropagation();
+             return false;
+         };
++
++        // Once the page is no longer the keyboard focus its key up events are delivered elsewhere,
++        // so anything still down here would stay down on the server forever. These use
++        // addEventListener because the corresponding on* properties are taken elsewhere.
++        window.addEventListener("blur", () => this.release_all());
++        window.addEventListener("pagehide", () => this.release_all());
++        d.addEventListener("visibilitychange", () => {
++            if (d.hidden)
++                this.release_all();
++        });
+     }
+ 
+     onEvent(event: KeyboardEvent, event_type: string) {
++        if (event_type == "up") {
++            this.keys_down.delete(event.code);
++        } else {
++            // A modifier the user was already holding when the page took focus never has its key
++            // down delivered here, yet the server presses it anyway from the flags every event
++            // carries. Track it from those flags too, or it is the one thing left stuck.
++            for (let [held, code] of [
++                [event.altKey, "AltLeft"],
++                [event.ctrlKey, "ControlLeft"],
++                [event.shiftKey, "ShiftLeft"],
++                [event.metaKey, "MetaLeft"],
++            ] as [boolean, string][]) {
++                if (held && !this.keys_down.has(code))
++                    this.keys_down.set(code, KEvent.release(code, 0));
++            }
++            this.keys_down.set(event.code, KEvent.release(event.code, event.location));
++        }
+         this.webSocket.send(JSON.stringify({ "KeyboardEvent": new KEvent(event_type, event) }));
+         event.preventDefault();
+         event.stopPropagation();
+         return false;
+     }
++
++    release_all() {
++        // Newest first, so a plain key is released before the modifier that was held with it.
++        let releases = Array.from(this.keys_down.values()).reverse();
++        this.keys_down.clear();
++        if (this.webSocket.readyState != WebSocket.OPEN)
++            return;
++        for (let release of releases)
++            this.webSocket.send(JSON.stringify({ "KeyboardEvent": release }));
++    }
+ }
+ 
+ function frame_rate_stats() {

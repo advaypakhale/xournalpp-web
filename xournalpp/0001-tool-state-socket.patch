@@ -1,0 +1,367 @@
+diff --git a/src/core/control/Control.cpp b/src/core/control/Control.cpp
+index 68919cf..792cc06 100644
+--- a/src/core/control/Control.cpp
++++ b/src/core/control/Control.cpp
+@@ -37,6 +37,7 @@
+ #include "control/settings/ViewModes.h"                          // for ViewM..
+ #include "control/tools/TextEditor.h"                            // for Text...
+ #include "control/xojfile/LoadHandler.h"                         // for Load...
++#include "control/ToolStateSocket.h"                             // for Tool...
+ #include "control/zoom/ZoomControl.h"                            // for Zoom...
+ #include "gui/FloatingToolbox.h"                                 // for Floa...
+ #include "gui/MainWindow.h"                                      // for Main...
+@@ -107,6 +108,7 @@
+ #include "util/serializing/InputStreamException.h"               // for Inpu...
+ #include "util/serializing/ObjectInputStream.h"                  // for Obje...
+ #include "view/CompassView.h"                                    // for Comp...
++#include "view/StrokeView.h"                                     // for OPAC...
+ #include "view/SetsquareView.h"                                  // for Sets...
+ #include "view/overlays/OverlayView.h"                           // for Over...
+ 
+@@ -161,6 +163,11 @@ Control::Control(GApplication* gtkApp, GladeSearchpath* gladeSearchPath, bool di
+     this->toolHandler->loadSettings();
+     this->initButtonTool();
+ 
++    if (const char* toolSocketPath = g_getenv("XOURNALPP_TOOL_SOCKET"); toolSocketPath && *toolSocketPath) {
++        this->toolStateSocket = std::make_unique<ToolStateSocket>(toolSocketPath);
++        this->zoom->addZoomListener(this);
++    }
++
+     /**
+      * This is needed to update the previews
+      */
+@@ -1235,6 +1242,8 @@ void Control::toolChanged() {
+             win->getXournal()->endSplineAllPages();
+         }
+     }
++
++    publishToolState();
+ }
+ 
+ void Control::eraserSizeChanged() {
+@@ -1259,6 +1268,8 @@ void Control::toolSizeChanged() {
+     this->actionDB->setActionState(Action::TOOL_SIZE, toolHandler->getSize());
+ 
+     getCursor()->updateCursor();
++
++    publishToolState();
+ }
+ 
+ void Control::toolFillChanged() {
+@@ -1316,6 +1327,39 @@ auto Control::getLineStyleToSelect() -> std::optional<string> const {
+ void Control::toolColorChanged() {
+     this->actionDB->setActionState(Action::TOOL_COLOR, getToolHandler()->getColorMaskAlpha());
+     getCursor()->updateCursor();
++
++    publishToolState();
++}
++
++void Control::zoomChanged() { publishToolState(); }
++
++void Control::publishToolState() {
++    if (!this->toolStateSocket) {
++        return;
++    }
++
++    ToolType type = toolHandler->getToolType();
++    // Selection tools can carry TOOL_CAP_SIZE without a thickness table, so
++    // ask only for tools that draw.
++    bool draws = type == TOOL_PEN || type == TOOL_ERASER || type == TOOL_HIGHLIGHTER;
++    double thickness = draws ? toolHandler->getThickness() : 0.0;
++    Color color = toolHandler->hasCapability(TOOL_CAP_COLOR) ? toolHandler->getColor() : Color(0xff000000U);
++    double alpha = type == TOOL_HIGHLIGHTER ? xoj::view::StrokeView::OPACITY_HIGHLIGHTER : 1.0;
++    double zoomValue = this->zoom ? this->zoom->getZoom() : 1.0;
++
++    // g_ascii_formatd: the decimal separator must not follow the locale
++    char alphaStr[G_ASCII_DTOSTR_BUF_SIZE];
++    char thicknessStr[G_ASCII_DTOSTR_BUF_SIZE];
++    char zoomStr[G_ASCII_DTOSTR_BUF_SIZE];
++    g_ascii_formatd(alphaStr, sizeof(alphaStr), "%.3f", alpha);
++    g_ascii_formatd(thicknessStr, sizeof(thicknessStr), "%.4f", thickness);
++    g_ascii_formatd(zoomStr, sizeof(zoomStr), "%.4f", zoomValue);
++
++    char line[192];
++    g_snprintf(line, sizeof(line), "{\"tool\":\"%s\",\"color\":\"#%02x%02x%02x\",\"alpha\":%s,\"thickness\":%s,\"zoom\":%s}",
++               std::string(toolTypeToString(type)).c_str(), color.red, color.green, color.blue, alphaStr, thicknessStr,
++               zoomStr);
++    this->toolStateSocket->publish(line);
+ }
+ 
+ void Control::changeColorOfSelection() {
+diff --git a/src/core/control/Control.h b/src/core/control/Control.h
+index e67e864..691d0c2 100644
+--- a/src/core/control/Control.h
++++ b/src/core/control/Control.h
+@@ -34,9 +34,12 @@
+ #include "model/PageRef.h"                          // for PageRef
+ #include "undo/UndoRedoHandler.h"                   // for UndoRedoHandler (ptr only)
+ 
+-#include "ClipboardHandler.h"  // for ClipboardListener
+-#include "ToolHandler.h"       // for ToolListener
+-#include "filesystem.h"        // for path
++#include "ClipboardHandler.h"       // for ClipboardListener
++#include "ToolHandler.h"            // for ToolListener
++#include "control/zoom/ZoomListener.h"  // for ZoomListener
++#include "filesystem.h"             // for path
++
++class ToolStateSocket;
+ 
+ class LoadHandler;
+ class GeometryToolController;
+@@ -73,6 +76,7 @@ class ActionDatabase;
+ 
+ class Control:
+         public ToolListener,
++        public ZoomListener,
+         public DocumentHandler,
+         public UndoRedoListener,
+         public ClipboardListener,
+@@ -168,6 +172,7 @@ public:
+     void toolSizeChanged() override;
+     void toolFillChanged() override;
+     void toolLineStyleChanged() override;
++    void zoomChanged() override;
+ 
+     void selectTool(ToolType type);
+     void selectDefaultTool();
+@@ -480,9 +485,17 @@ private:
+      */
+     auto getLineStyleToSelect() -> std::optional<std::string> const;
+ 
++    /**
++     * Push tool type, color, thickness and zoom to the socket named by
++     * XOURNALPP_TOOL_SOCKET, if that is set. No-op otherwise.
++     */
++    void publishToolState();
++
+     UndoRedoHandler* undoRedo = nullptr;
+     ZoomControl* zoom = nullptr;
+ 
++    std::unique_ptr<ToolStateSocket> toolStateSocket;
++
+     Settings* settings = nullptr;
+     std::unique_ptr<Palette> palette;
+     MainWindow* win = nullptr;
+diff --git a/src/core/control/ToolStateSocket.cpp b/src/core/control/ToolStateSocket.cpp
+new file mode 100644
+index 0000000..2567644
+--- /dev/null
++++ b/src/core/control/ToolStateSocket.cpp
+@@ -0,0 +1,159 @@
++#include "ToolStateSocket.h"
++
++#include <algorithm>
++#include <cerrno>
++#include <cstring>
++
++#include <fcntl.h>
++#include <glib.h>
++#include <poll.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++ToolStateSocket::ToolStateSocket(std::string path): path(std::move(path)) {
++    if (pipe2(this->wakeupFd, O_CLOEXEC | O_NONBLOCK) != 0) {
++        g_warning("ToolStateSocket: pipe2 failed: %s", strerror(errno));
++        return;
++    }
++
++    this->listenFd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
++    if (this->listenFd < 0) {
++        g_warning("ToolStateSocket: socket failed: %s", strerror(errno));
++        return;
++    }
++
++    sockaddr_un addr{};
++    addr.sun_family = AF_UNIX;
++    if (this->path.size() >= sizeof(addr.sun_path)) {
++        g_warning("ToolStateSocket: path too long: %s", this->path.c_str());
++        close(this->listenFd);
++        this->listenFd = -1;
++        return;
++    }
++    strncpy(addr.sun_path, this->path.c_str(), sizeof(addr.sun_path) - 1);
++
++    unlink(this->path.c_str());
++    if (bind(this->listenFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
++        listen(this->listenFd, 4) != 0) {
++        g_warning("ToolStateSocket: bind/listen on %s failed: %s", this->path.c_str(), strerror(errno));
++        close(this->listenFd);
++        this->listenFd = -1;
++        return;
++    }
++
++    this->thread = std::thread([this] { run(); });
++}
++
++ToolStateSocket::~ToolStateSocket() {
++    if (this->thread.joinable()) {
++        {
++            std::lock_guard<std::mutex> lock(this->mutex);
++            this->stop = true;
++        }
++        [[maybe_unused]] ssize_t n = write(this->wakeupFd[1], "x", 1);
++        this->thread.join();
++    }
++    for (int fd: this->clients) {
++        close(fd);
++    }
++    if (this->listenFd >= 0) {
++        close(this->listenFd);
++        unlink(this->path.c_str());
++    }
++    for (int fd: this->wakeupFd) {
++        if (fd >= 0) {
++            close(fd);
++        }
++    }
++}
++
++void ToolStateSocket::publish(const std::string& line) {
++    if (this->listenFd < 0) {
++        return;
++    }
++    {
++        std::lock_guard<std::mutex> lock(this->mutex);
++        if (line == this->current) {
++            return;
++        }
++        this->current = line;
++    }
++    [[maybe_unused]] ssize_t n = write(this->wakeupFd[1], "x", 1);
++}
++
++void ToolStateSocket::sendLine(int fd, const std::string& line) {
++    // A dropped client reconnects and gets a fresh snapshot, so a failed or
++    // even partial write is handled by closing, not by retrying.
++    std::string data = line + "\n";
++    ssize_t n = send(fd, data.c_str(), data.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
++    if (n != static_cast<ssize_t>(data.size())) {
++        close(fd);
++        this->clients.erase(std::remove(this->clients.begin(), this->clients.end(), fd), this->clients.end());
++    }
++}
++
++void ToolStateSocket::run() {
++    std::string lastSent;
++    while (true) {
++        std::vector<pollfd> fds;
++        fds.push_back({this->wakeupFd[0], POLLIN, 0});
++        fds.push_back({this->listenFd, POLLIN, 0});
++        for (int fd: this->clients) {
++            fds.push_back({fd, POLLIN, 0});
++        }
++
++        if (poll(fds.data(), fds.size(), -1) < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            g_warning("ToolStateSocket: poll failed: %s", strerror(errno));
++            return;
++        }
++
++        std::string line;
++        {
++            std::lock_guard<std::mutex> lock(this->mutex);
++            if (this->stop) {
++                return;
++            }
++            line = this->current;
++        }
++
++        if (fds[0].revents & POLLIN) {
++            char buf[64];
++            while (read(this->wakeupFd[0], buf, sizeof(buf)) > 0) {}
++        }
++
++        // Clients never send anything meaningful; readability means EOF or
++        // stray bytes to discard.
++        for (size_t i = 2; i < fds.size(); i++) {
++            if (fds[i].revents & (POLLIN | POLLERR | POLLHUP)) {
++                char buf[256];
++                ssize_t n = read(fds[i].fd, buf, sizeof(buf));
++                if (n <= 0 && !(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
++                    close(fds[i].fd);
++                    this->clients.erase(std::remove(this->clients.begin(), this->clients.end(), fds[i].fd),
++                                        this->clients.end());
++                }
++            }
++        }
++
++        if (fds[1].revents & POLLIN) {
++            int fd;
++            while ((fd = accept4(this->listenFd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC)) >= 0) {
++                this->clients.push_back(fd);
++                if (!line.empty()) {
++                    sendLine(fd, line);
++                }
++            }
++        }
++
++        if (line != lastSent) {
++            lastSent = line;
++            for (int fd: std::vector<int>(this->clients)) {
++                sendLine(fd, line);
++            }
++        }
++    }
++}
+diff --git a/src/core/control/ToolStateSocket.h b/src/core/control/ToolStateSocket.h
+new file mode 100644
+index 0000000..45a7934
+--- /dev/null
++++ b/src/core/control/ToolStateSocket.h
+@@ -0,0 +1,52 @@
++/*
++ * Xournal++
++ *
++ * Publishes the active tool state as newline-delimited JSON
++ * on a unix stream socket
++ *
++ * @author Xournal++ Team
++ * https://github.com/xournalpp/xournalpp
++ *
++ * @license GNU GPLv2 or later
++ */
++
++#pragma once
++
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++/**
++ * Binds and listens on a unix stream socket and pushes the most recently
++ * published line to every connected client, immediately on connect and again
++ * whenever it changes. publish() never blocks the caller: it stores the line
++ * and pokes the socket thread through a pipe. Clients may come and go at any
++ * time; a slow or dead client is dropped, never waited for.
++ */
++class ToolStateSocket {
++public:
++    explicit ToolStateSocket(std::string path);
++    ~ToolStateSocket();
++
++    ToolStateSocket(const ToolStateSocket&) = delete;
++    ToolStateSocket& operator=(const ToolStateSocket&) = delete;
++
++    /** Thread-safe. line must not contain a newline; duplicates are dropped. */
++    void publish(const std::string& line);
++
++private:
++    void run();
++    void sendLine(int fd, const std::string& line);
++
++    std::string path;
++    int listenFd = -1;
++    int wakeupFd[2] = {-1, -1};
++
++    std::mutex mutex;
++    std::string current;
++    bool stop = false;
++
++    std::vector<int> clients;
++    std::thread thread;
++};

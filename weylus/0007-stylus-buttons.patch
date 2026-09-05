@@ -1,0 +1,101 @@
+diff --git a/lib/linux/uinput.c b/lib/linux/uinput.c
+index 8417303..13cb068 100644
+--- a/lib/linux/uinput.c
++++ b/lib/linux/uinput.c
+@@ -154,6 +154,10 @@ void init_stylus(int fd, const char* name, Error* err)
+ 		ERROR(err, 1, "error: ioctl UI_SET_KEYBIT BTN_TOOL_RUBBER");
+ 	if (ioctl(fd, UI_SET_KEYBIT, BTN_TOUCH) < 0)
+ 		ERROR(err, 1, "error: ioctl UI_SET_KEYBIT BTN_TOUCH");
++	if (ioctl(fd, UI_SET_KEYBIT, BTN_STYLUS) < 0)
++		ERROR(err, 1, "error: ioctl UI_SET_KEYBIT BTN_STYLUS");
++	if (ioctl(fd, UI_SET_KEYBIT, BTN_STYLUS2) < 0)
++		ERROR(err, 1, "error: ioctl UI_SET_KEYBIT BTN_STYLUS2");
+ 
+ 	// setup sending timestamps
+ 	if (ioctl(fd, UI_SET_EVBIT, EV_MSC) < 0)
+diff --git a/src/input/uinput_device.rs b/src/input/uinput_device.rs
+index dceb3c7..9cfa37d 100644
+--- a/src/input/uinput_device.rs
++++ b/src/input/uinput_device.rs
+@@ -37,6 +37,7 @@ pub struct UInputDevice {
+     touches: [Option<MultiTouch>; 5],
+     tool_pen_active: bool,
+     pen_touching: bool,
++    stylus_buttons: Button,
+     last_pen_event: Instant,
+     capturable: Option<Box<dyn Capturable>>,
+     geometry: Rect,
+@@ -105,6 +106,7 @@ impl UInputDevice {
+             touches: Default::default(),
+             tool_pen_active: false,
+             pen_touching: false,
++            stylus_buttons: Button::NONE,
+             last_pen_event: Instant::now(),
+             capturable,
+             geometry: Rect::default(),
+@@ -161,6 +163,26 @@ impl UInputDevice {
+             warn!("{}", err);
+         }
+     }
++
++    // Emits BTN_STYLUS/BTN_STYLUS2 transitions so the barrel buttons match
++    // `buttons` (the browser's currently-held set). Idempotent; called with
++    // Button::NONE to force a release when the pen leaves proximity.
++    fn sync_stylus_buttons(&mut self, buttons: Button) {
++        let desired = buttons & (Button::SECONDARY | Button::AUXILARY);
++        // A Wacom pen's lower barrel button reaches the browser as the
++        // auxiliary button and the upper one as the secondary button, which is
++        // the opposite of what their evdev codes suggest.
++        for (flag, code) in [
++            (Button::AUXILARY, EC_KEY_STYLUS),
++            (Button::SECONDARY, EC_KEY_STYLUS2),
++        ] {
++            let want = desired.contains(flag);
++            if want != self.stylus_buttons.contains(flag) {
++                self.send(self.stylus_fd, ET_KEY, code, want as c_int);
++            }
++        }
++        self.stylus_buttons = desired;
++    }
+ }
+ 
+ impl Drop for UInputDevice {
+@@ -190,6 +212,8 @@ const EC_KEY_MOUSE_MIDDLE: c_int = 0x112;
+ const EC_KEY_TOOL_PEN: c_int = 0x140;
+ const EC_KEY_TOOL_RUBBER: c_int = 0x141;
+ const EC_KEY_TOUCH: c_int = 0x14a;
++const EC_KEY_STYLUS: c_int = 0x14b;
++const EC_KEY_STYLUS2: c_int = 0x14c;
+ const EC_KEY_TOOL_FINGER: c_int = 0x145;
+ const EC_KEY_TOOL_DOUBLETAP: c_int = 0x14d;
+ const EC_KEY_TOOL_TRIPLETAP: c_int = 0x14e;
+@@ -334,6 +358,7 @@ impl InputDevice for UInputDevice {
+                 {
+                     self.tool_pen_active = false;
+                     self.send(self.stylus_fd, ET_KEY, EC_KEY_TOUCH, 0);
++                    self.sync_stylus_buttons(Button::NONE);
+                     self.send(self.stylus_fd, ET_KEY, EC_KEY_TOOL_PEN, 0);
+                     self.send(self.stylus_fd, ET_KEY, EC_KEY_TOOL_RUBBER, 0);
+                     self.send(self.stylus_fd, ET_ABSOLUTE, EC_ABSOLUTE_PRESSURE, 0);
+@@ -511,6 +536,11 @@ impl InputDevice for UInputDevice {
+                     | PointerEventType::MOVE
+                     | PointerEventType::OVER
+                     | PointerEventType::ENTER => {
++                        // Before BTN_TOUCH so Xournal++ sees the barrel press
++                        // first and picks the tool for the whole drag. Driven
++                        // by `buttons` because a chorded press (barrel while
++                        // the tip is down, or the reverse) arrives as a MOVE.
++                        self.sync_stylus_buttons(event.buttons);
+                         if let PointerEventType::DOWN = event.event_type {
+                             self.pen_touching = true;
+                             self.send(self.stylus_fd, ET_KEY, EC_KEY_TOUCH, 1);
+@@ -565,6 +595,9 @@ impl InputDevice for UInputDevice {
+                     | PointerEventType::LEAVE
+                     | PointerEventType::OUT => {
+                         self.send(self.stylus_fd, ET_KEY, EC_KEY_TOUCH, 0);
++                        // Forced release: the pen is leaving proximity, and a
++                        // barrel button latched here would stick forever.
++                        self.sync_stylus_buttons(Button::NONE);
+                         self.send(self.stylus_fd, ET_KEY, EC_KEY_TOOL_PEN, 0);
+                         self.send(self.stylus_fd, ET_KEY, EC_KEY_TOOL_RUBBER, 0);
+                         self.send(self.stylus_fd, ET_ABSOLUTE, EC_ABSOLUTE_PRESSURE, 0);
