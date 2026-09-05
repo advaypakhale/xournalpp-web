@@ -1,0 +1,22 @@
+Disable Nagle on the client socket.
+
+Video frames are written as they are encoded, and Nagle held each frame's tail
+until the peer acknowledged the previous one.
+
+diff --git a/src/web.rs b/src/web.rs
+index dc844d3..783ff7c 100644
+--- a/src/web.rs
++++ b/src/web.rs
+@@ -302,6 +302,12 @@ async fn run_server(
+ 
+         debug!(address = ?remote_address, "Client connected.");
+ 
++        // Video frames are written as they are encoded; Nagle would hold each
++        // frame's tail until the peer acknowledges the previous one.
++        if let Err(err) = tcp.set_nodelay(true) {
++            warn!("Failed to set TCP_NODELAY: {err}.");
++        }
++
+         let io = TokioIo::new(tcp);
+ 
+         let sender_ui = sender_ui.clone();

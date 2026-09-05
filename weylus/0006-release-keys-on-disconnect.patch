@@ -1,3 +1,12 @@
+Release keys a departing client left held, on the server and in the page.
+
+A client that closes mid-shortcut never sends the matching key up events, and
+the virtual keyboard stays latched for whoever connects next. The device now
+records which client pressed each key and releases that client's keys when it
+goes away, leaving keys held by other clients sharing the device alone. The
+page sends its own releases on blur, pagehide and visibilitychange, where its
+key up events are delivered elsewhere.
+
 diff --git a/src/input/device.rs b/src/input/device.rs
 index 920406e..8751f7c 100644
 --- a/src/input/device.rs
@@ -12,7 +21,7 @@ index 920406e..8751f7c 100644
 +    fn release_keys(&mut self) {}
  }
 diff --git a/src/input/uinput_device.rs b/src/input/uinput_device.rs
-index 9cfa37d..0c32428 100644
+index 0faf5fd..61e2c79 100644
 --- a/src/input/uinput_device.rs
 +++ b/src/input/uinput_device.rs
 @@ -1,6 +1,8 @@
@@ -87,7 +96,7 @@ index 9cfa37d..0c32428 100644
  }
  
  impl Drop for UInputDevice {
-@@ -939,24 +981,19 @@ impl InputDevice for UInputDevice {
+@@ -949,34 +991,34 @@ impl InputDevice for UInputDevice {
          }
  
          if event.ctrl {
@@ -117,7 +126,10 @@ index 9cfa37d..0c32428 100644
      }
  
      fn set_capturable(&mut self, capturable: Box<dyn Capturable>) {
-@@ -966,6 +1003,10 @@ impl InputDevice for UInputDevice {
+-        self.capturable = capturable;
++        self.capturable = Some(capturable);
+     }
+ 
      fn device_type(&self) -> InputDeviceType {
          InputDeviceType::UInputDevice
      }
@@ -126,42 +138,34 @@ index 9cfa37d..0c32428 100644
 +        self.release_keys_of(OWNER_EXCLUSIVE);
 +    }
  }
- 
++
  // The X display and capturable inside are only ever used by the thread holding the mutex in
-@@ -973,26 +1014,47 @@ impl InputDevice for UInputDevice {
+ // SharedUInputDevice, which is what makes moving them between threads sound.
  unsafe impl Send for UInputDevice {}
- 
+@@ -984,11 +1026,17 @@ unsafe impl Send for UInputDevice {}
  /// One set of uinput devices used by every client, created before any client connects.
--pub struct SharedUInputDevice(pub Arc<Mutex<UInputDevice>>);
-+pub struct SharedUInputDevice {
-+    device: Arc<Mutex<UInputDevice>>,
+ pub struct SharedUInputDevice {
+     device: Arc<Mutex<UInputDevice>>,
 +    /// Tells this client's key presses apart from those of the other clients sharing the device.
 +    owner: u64,
-+}
-+
-+impl SharedUInputDevice {
-+    pub fn new(device: Arc<Mutex<UInputDevice>>) -> Self {
+ }
+ 
+ impl SharedUInputDevice {
+     pub fn new(device: Arc<Mutex<UInputDevice>>) -> Self {
+-        Self { device }
 +        static NEXT_OWNER: AtomicU64 = AtomicU64::new(OWNER_EXCLUSIVE + 1);
 +        Self {
 +            device,
 +            owner: NEXT_OWNER.fetch_add(1, AtomicOrdering::Relaxed),
 +        }
-+    }
-+}
- 
- impl InputDevice for SharedUInputDevice {
-     fn send_wheel_event(&mut self, event: &WheelEvent) {
--        self.0.lock().unwrap().send_wheel_event(event)
-+        self.device.lock().unwrap().send_wheel_event(event)
      }
+ }
  
-     fn send_pointer_event(&mut self, event: &PointerEvent) {
--        self.0.lock().unwrap().send_pointer_event(event)
-+        self.device.lock().unwrap().send_pointer_event(event)
+@@ -1002,7 +1050,10 @@ impl InputDevice for SharedUInputDevice {
      }
  
      fn send_keyboard_event(&mut self, event: &KeyboardEvent) {
--        self.0.lock().unwrap().send_keyboard_event(event)
+-        self.device.lock().unwrap().send_keyboard_event(event)
 +        self.device
 +            .lock()
 +            .unwrap()
@@ -169,10 +173,7 @@ index 9cfa37d..0c32428 100644
      }
  
      fn set_capturable(&mut self, capturable: Box<dyn Capturable>) {
--        self.0.lock().unwrap().set_capturable(capturable)
-+        self.device.lock().unwrap().set_capturable(capturable)
-     }
- 
+@@ -1012,4 +1063,8 @@ impl InputDevice for SharedUInputDevice {
      fn device_type(&self) -> InputDeviceType {
          InputDeviceType::UInputDevice
      }
@@ -182,10 +183,10 @@ index 9cfa37d..0c32428 100644
 +    }
  }
 diff --git a/src/websocket.rs b/src/websocket.rs
-index 13f1696..01f9af6 100644
+index c5467fa..40953ea 100644
 --- a/src/websocket.rs
 +++ b/src/websocket.rs
-@@ -152,6 +152,12 @@ impl<S, R, FnUInput> WeylusClientHandler<S, R, FnUInput> {
+@@ -150,6 +150,12 @@ impl<S, R, FnUInput> WeylusClientHandler<S, R, FnUInput> {
              }
          }
  
@@ -198,20 +199,11 @@ index 13f1696..01f9af6 100644
          drop(self.video_sender);
          if let Err(err) = self.video_thread.join() {
              warn!("Failed to join video thread: {err:?}");
-@@ -237,7 +243,7 @@ impl<S, R, FnUInput> WeylusClientHandler<S, R, FnUInput> {
-                         d.device_type() != InputDeviceType::UInputDevice
-                     }) {
-                         self.input_device = Some(Box::new(
--                            crate::input::uinput_device::SharedUInputDevice(shared.clone()),
-+                            crate::input::uinput_device::SharedUInputDevice::new(shared.clone()),
-                         ));
-                     }
-                     if let Some(d) = self.input_device.as_mut() {
 diff --git a/ts/lib.ts b/ts/lib.ts
-index 3ac44c5..dcbb821 100644
+index 1fac274..7db2a6d 100644
 --- a/ts/lib.ts
 +++ b/ts/lib.ts
-@@ -1526,10 +1526,20 @@ class KEvent {
+@@ -845,10 +845,20 @@ class KEvent {
          this.shift = event.shiftKey;
          this.meta = event.metaKey;
      }
@@ -232,7 +224,7 @@ index 3ac44c5..dcbb821 100644
  
      constructor(webSocket: WebSocket) {
          this.webSocket = webSocket;
-@@ -1565,14 +1575,51 @@ class KeyboardHandler {
+@@ -884,14 +894,51 @@ class KeyboardHandler {
              e.stopPropagation();
              return false;
          };

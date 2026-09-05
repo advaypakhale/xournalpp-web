@@ -1,3 +1,8 @@
+Build against FFmpeg 6.1's buffersink API as well as 7.1's.
+
+av_opt_set_array and the "pixel_formats" option arrived in FFmpeg 7.1; Ubuntu
+24.04 ships 6.1, where the equivalent is av_opt_set_bin on "pix_fmts".
+
 diff --git a/lib/encode_video.c b/lib/encode_video.c
 index 0d09b32..6885ba4 100644
 --- a/lib/encode_video.c

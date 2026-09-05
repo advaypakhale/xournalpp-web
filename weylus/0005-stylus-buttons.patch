@@ -1,3 +1,28 @@
+Relay the pen's barrel buttons as BTN_STYLUS and BTN_STYLUS2.
+
+The uinput stylus never declared the keybits, so a barrel press could not reach
+Xournal++ to switch tools. They are emitted before BTN_TOUCH because Xournal++
+picks the tool for the whole drag from the button state at the moment the tip
+goes down, and forced off when the pen leaves proximity, where a latched button
+would otherwise stick.
+
+build.rs watched lib/linux/uniput.c, one letter off from the file it compiles,
+so a change to uinput.c alone rebuilt nothing. This is the first patch to change
+that file, and it only took effect because Docker builds from a clean tree.
+
+diff --git a/build.rs b/build.rs
+index c25fac5..2e9bcad 100644
+--- a/build.rs
++++ b/build.rs
+@@ -162,7 +162,7 @@ fn main() {
+ }
+ 
+ fn linux() {
+-    println!("cargo:rerun-if-changed=lib/linux/uniput.c");
++    println!("cargo:rerun-if-changed=lib/linux/uinput.c");
+     println!("cargo:rerun-if-changed=lib/linux/xcapture.c");
+     println!("cargo:rerun-if-changed=lib/linux/xhelper.c");
+     println!("cargo:rerun-if-changed=lib/linux/xhelper.h");
 diff --git a/lib/linux/uinput.c b/lib/linux/uinput.c
 index 8417303..13cb068 100644
 --- a/lib/linux/uinput.c
@@ -14,7 +39,7 @@ index 8417303..13cb068 100644
  	// setup sending timestamps
  	if (ioctl(fd, UI_SET_EVBIT, EV_MSC) < 0)
 diff --git a/src/input/uinput_device.rs b/src/input/uinput_device.rs
-index dceb3c7..9cfa37d 100644
+index e7cf38d..0faf5fd 100644
 --- a/src/input/uinput_device.rs
 +++ b/src/input/uinput_device.rs
 @@ -37,6 +37,7 @@ pub struct UInputDevice {
@@ -69,7 +94,7 @@ index dceb3c7..9cfa37d 100644
  const EC_KEY_TOOL_FINGER: c_int = 0x145;
  const EC_KEY_TOOL_DOUBLETAP: c_int = 0x14d;
  const EC_KEY_TOOL_TRIPLETAP: c_int = 0x14e;
-@@ -334,6 +358,7 @@ impl InputDevice for UInputDevice {
+@@ -344,6 +368,7 @@ impl InputDevice for UInputDevice {
                  {
                      self.tool_pen_active = false;
                      self.send(self.stylus_fd, ET_KEY, EC_KEY_TOUCH, 0);
@@ -77,7 +102,7 @@ index dceb3c7..9cfa37d 100644
                      self.send(self.stylus_fd, ET_KEY, EC_KEY_TOOL_PEN, 0);
                      self.send(self.stylus_fd, ET_KEY, EC_KEY_TOOL_RUBBER, 0);
                      self.send(self.stylus_fd, ET_ABSOLUTE, EC_ABSOLUTE_PRESSURE, 0);
-@@ -511,6 +536,11 @@ impl InputDevice for UInputDevice {
+@@ -521,6 +546,11 @@ impl InputDevice for UInputDevice {
                      | PointerEventType::MOVE
                      | PointerEventType::OVER
                      | PointerEventType::ENTER => {
@@ -89,7 +114,7 @@ index dceb3c7..9cfa37d 100644
                          if let PointerEventType::DOWN = event.event_type {
                              self.pen_touching = true;
                              self.send(self.stylus_fd, ET_KEY, EC_KEY_TOUCH, 1);
-@@ -565,6 +595,9 @@ impl InputDevice for UInputDevice {
+@@ -575,6 +605,9 @@ impl InputDevice for UInputDevice {
                      | PointerEventType::LEAVE
                      | PointerEventType::OUT => {
                          self.send(self.stylus_fd, ET_KEY, EC_KEY_TOUCH, 0);

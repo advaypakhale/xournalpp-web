@@ -1,3 +1,17 @@
+Create the uinput devices at startup and share them across clients.
+
+Weylus creates a set of uinput devices per client, after the X server is
+already running. An X server without udev hotplug only opens the devices it
+found at startup, so devices created later are invisible to it.
+--precreate-uinput makes one set before any client connects and hands every
+client the same set behind a mutex. The capturable becomes optional because the
+devices now exist before any client has chosen one, and the X connection is
+acquired lazily because they can predate the X server.
+
+The unwrap on the geometry query goes with it: behind the shared mutex a panic
+there poisons the lock, so one transient X error killed input for the rest of
+the process's life while the video kept streaming.
+
 diff --git a/src/config.rs b/src/config.rs
 index 6b2a717..27922e8 100644
 --- a/src/config.rs
@@ -18,7 +32,7 @@ index 6b2a717..27922e8 100644
      #[arg(long, help = "Print template of index.html served by Weylus.")]
      #[serde(skip)]
 diff --git a/src/input/uinput_device.rs b/src/input/uinput_device.rs
-index 80e8023..d849b4a 100644
+index 80e8023..e1b942d 100644
 --- a/src/input/uinput_device.rs
 +++ b/src/input/uinput_device.rs
 @@ -1,6 +1,7 @@
@@ -63,7 +77,7 @@ index 80e8023..d849b4a 100644
              warn!("Failed to activate window, sending no input ({})", err);
              return;
          }
-@@ -276,11 +284,19 @@ impl InputDevice for UInputDevice {
+@@ -276,11 +284,29 @@ impl InputDevice for UInputDevice {
      }
  
      fn send_pointer_event(&mut self, event: &PointerEvent) {
@@ -81,11 +95,21 @@ index 80e8023..d849b4a 100644
 +        if self.x11ctx.is_none() {
 +            self.x11ctx = X11Context::new();
 +        }
-+        let (x, y, width, height) = match capturable.geometry().unwrap() {
++        // A window that goes away between the capture thread noticing and the pointer event
++        // arriving fails here. Panicking would poison the mutex a shared device sits behind
++        // and take every later event with it, so drop this one and carry on.
++        let geometry = match capturable.geometry() {
++            Ok(geometry) => geometry,
++            Err(err) => {
++                warn!("Failed to get window geometry, sending no input ({})", err);
++                return;
++            }
++        };
++        let (x, y, width, height) = match geometry {
              Geometry::Relative(x, y, width, height) => (x, y, width, height),
          };
          self.geometry.x = x;
-@@ -642,7 +658,11 @@ impl InputDevice for UInputDevice {
+@@ -642,7 +668,11 @@ impl InputDevice for UInputDevice {
  
      fn send_keyboard_event(&mut self, event: &KeyboardEvent) {
          use crate::input::uinput_keys::*;
@@ -98,46 +122,48 @@ index 80e8023..d849b4a 100644
              warn!("Failed to activate window, sending no input ({})", err);
              return;
          }
-@@ -907,7 +927,36 @@ impl InputDevice for UInputDevice {
+@@ -914,3 +944,39 @@ impl InputDevice for UInputDevice {
+         InputDeviceType::UInputDevice
      }
- 
-     fn set_capturable(&mut self, capturable: Box<dyn Capturable>) {
--        self.capturable = capturable;
-+        self.capturable = Some(capturable);
+ }
++// The X display and capturable inside are only ever used by the thread holding the mutex in
++// SharedUInputDevice, which is what makes moving them between threads sound.
++unsafe impl Send for UInputDevice {}
++
++/// One set of uinput devices used by every client, created before any client connects.
++pub struct SharedUInputDevice {
++    device: Arc<Mutex<UInputDevice>>,
++}
++
++impl SharedUInputDevice {
++    pub fn new(device: Arc<Mutex<UInputDevice>>) -> Self {
++        Self { device }
++    }
++}
++
++impl InputDevice for SharedUInputDevice {
++    fn send_wheel_event(&mut self, event: &WheelEvent) {
++        self.device.lock().unwrap().send_wheel_event(event)
++    }
++
++    fn send_pointer_event(&mut self, event: &PointerEvent) {
++        self.device.lock().unwrap().send_pointer_event(event)
++    }
++
++    fn send_keyboard_event(&mut self, event: &KeyboardEvent) {
++        self.device.lock().unwrap().send_keyboard_event(event)
++    }
++
++    fn set_capturable(&mut self, capturable: Box<dyn Capturable>) {
++        self.device.lock().unwrap().set_capturable(capturable)
 +    }
 +
 +    fn device_type(&self) -> InputDeviceType {
 +        InputDeviceType::UInputDevice
 +    }
 +}
-+
-+// The X display and capturable inside are only ever used by the thread holding the mutex in
-+// SharedUInputDevice, which is what makes moving them between threads sound.
-+unsafe impl Send for UInputDevice {}
-+
-+/// One set of uinput devices used by every client, created before any client connects.
-+pub struct SharedUInputDevice(pub Arc<Mutex<UInputDevice>>);
-+
-+impl InputDevice for SharedUInputDevice {
-+    fn send_wheel_event(&mut self, event: &WheelEvent) {
-+        self.0.lock().unwrap().send_wheel_event(event)
-+    }
-+
-+    fn send_pointer_event(&mut self, event: &PointerEvent) {
-+        self.0.lock().unwrap().send_pointer_event(event)
-+    }
-+
-+    fn send_keyboard_event(&mut self, event: &KeyboardEvent) {
-+        self.0.lock().unwrap().send_keyboard_event(event)
-+    }
-+
-+    fn set_capturable(&mut self, capturable: Box<dyn Capturable>) {
-+        self.0.lock().unwrap().set_capturable(capturable)
-     }
- 
-     fn device_type(&self) -> InputDeviceType {
 diff --git a/src/websocket.rs b/src/websocket.rs
-index 4cfb2f5..e302276 100644
+index 4cfb2f5..c5467fa 100644
 --- a/src/websocket.rs
 +++ b/src/websocket.rs
 @@ -3,7 +3,7 @@ use hyper::upgrade::Upgraded;
@@ -174,7 +200,7 @@ index 4cfb2f5..e302276 100644
 +                        d.device_type() != InputDeviceType::UInputDevice
 +                    }) {
 +                        self.input_device = Some(Box::new(
-+                            crate::input::uinput_device::SharedUInputDevice(shared.clone()),
++                            crate::input::uinput_device::SharedUInputDevice::new(shared.clone()),
 +                        ));
 +                    }
 +                    if let Some(d) = self.input_device.as_mut() {

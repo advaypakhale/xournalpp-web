@@ -1,5 +1,301 @@
+Send Annex-B H.264 frames and decode them with WebCodecs.
+
+The fMP4 muxer existed only to feed MediaSource. A media element keeps a reserve
+of frames so that playback stays smooth, and that reserve was the largest single
+delay in the system. libavformat is removed entirely: each encoded packet is
+handed to Rust behind a nine-byte header carrying a keyframe flag and the
+capture timestamp, and the page feeds the frames to a VideoDecoder and paints
+them on a canvas. The codec string is read out of the stream's own SPS
+rather than hardcoded, so a hardware encoder that picks a different profile
+still decodes.
+
+AV_CODEC_FLAG_GLOBAL_HEADER must stay unset: it moves SPS/PPS into extradata,
+and there is no container left to carry them. Unset, x264 repeats them in-band
+ahead of every IDR, which is what the decoder needs to configure itself.
+
+gop_size goes from 12 to 120 in the same change. Keyframes bought nothing once
+the client stopped seeking to the live edge on every frame, and each one is a
+bandwidth spike; 120 is as far as it can go before a joining client waits too
+long for its first picture.
+
+write_video_packet also gains extern "C". #[no_mangle] on a plain fn is
+formally undefined behaviour.
+
+diff --git a/lib/encode_video.c b/lib/encode_video.c
+index 6885ba4..9085365 100644
+--- a/lib/encode_video.c
++++ b/lib/encode_video.c
+@@ -5,10 +5,7 @@
+ #include <libavcodec/avcodec.h>
+ #include <libavfilter/buffersink.h>
+ #include <libavfilter/buffersrc.h>
+-#include <libavformat/avformat.h>
+-#include <libavformat/avio.h>
+ #include <libavutil/buffer.h>
+-#include <libavutil/dict.h>
+ #include <libavutil/error.h>
+ #include <libavutil/frame.h>
+ #include <libavutil/hwcontext.h>
+@@ -48,7 +45,6 @@ typedef struct Scalers
+ 
+ typedef struct VideoContext
+ {
+-	AVFormatContext* oc;
+ 	AVCodecContext* c;
+ 
+ 	// pointer to the frame to be encoded, one of frame_out in scalers.bgr0/rgb0/rgb
+@@ -59,12 +55,10 @@ typedef struct VideoContext
+ 	AVBufferRef* hw_device_ctx;
+ 
+ 	AVPacket* pkt;
+-	AVStream* st;
+ 	int width_out;
+ 	int height_out;
+ 	int width_in;
+ 	int height_in;
+-	void* buf;
+ 	void* rust_ctx;
+ 	int pts;
+ 	int initialized;
+@@ -76,7 +70,8 @@ typedef struct VideoContext
+ } VideoContext;
+ 
+ // this is a rust function and lives in src/video.rs
+-int write_video_packet(void* rust_ctx, const uint8_t* buf, int buf_size);
++void write_video_packet(
++	void* rust_ctx, const uint8_t* buf, int buf_size, uint64_t capture_us, int is_keyframe);
+ 
+ #if defined(__clang__) || defined(__GNUC__)
+ void log_callback(__attribute__((unused)) void* _ptr, int level, const char* fmt_orig, va_list args)
+@@ -139,11 +134,17 @@ void set_codec_params(VideoContext* ctx)
+ 	ctx->c->time_base = TIME_BASE;
+ 	ctx->c->framerate = (AVRational){0, 1};
+ 
+-	ctx->c->gop_size = 12;
++	// Upstream's 12 puts an IDR on the wire 2.5 times a second, each one a
++	// bandwidth spike. The stream is only ever played live, so keyframes are
++	// needed just often enough for a client that joins mid-stream to get a
++	// picture soon after it connects.
++	ctx->c->gop_size = 120;
+ 	// no B-frames to reduce latency
+ 	ctx->c->max_b_frames = 0;
+-	if (ctx->oc->oformat->flags & AVFMT_GLOBALHEADER)
+-		ctx->c->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
++	// AV_CODEC_FLAG_GLOBAL_HEADER is deliberately not set: it moves SPS/PPS out
++	// of the bitstream and into extradata, and there is no container left to
++	// carry them. Without it x264 repeats them in-band ahead of every IDR,
++	// which is what the WebCodecs decoder needs to configure itself.
+ }
+ 
+ void destroy_scale_ctx(ScaleContext* ctx)
+@@ -497,12 +498,6 @@ void open_video(VideoContext* ctx, Error* err)
+ 	const AVCodec* codec;
+ 	int ret;
+ 
+-	avformat_alloc_output_context2(&ctx->oc, NULL, "mp4", NULL);
+-	if (!ctx->oc)
+-	{
+-		ERROR(err, 1, "Could not find output format mp4.");
+-	}
+-
+ 	int using_hw = 0;
+ 
+ #ifdef HAS_VAAPI
+@@ -778,29 +773,10 @@ void open_video(VideoContext* ctx, Error* err)
+ 		}
+ 	}
+ 
+-	ctx->st = avformat_new_stream(ctx->oc, NULL);
+-	avcodec_parameters_from_context(ctx->st->codecpar, ctx->c);
+-
+ 	ctx->pkt = av_packet_alloc();
+ 	if (!ctx->pkt)
+ 		ERROR(err, 1, "Failed to allocate packet");
+ 
+-	int buf_size = 1024 * 1024;
+-	ctx->buf = av_malloc(buf_size);
+-	ctx->oc->pb = avio_alloc_context(
+-		ctx->buf, buf_size, AVIO_FLAG_WRITE, ctx->rust_ctx, NULL, write_video_packet, NULL);
+-	if (!ctx->oc->pb)
+-		ERROR(err, 1, "Failed to allocate avio context");
+-
+-	AVDictionary* opt = NULL;
+-
+-	// enable writing fragmented mp4
+-	av_dict_set(&opt, "movflags", "frag_custom+empty_moov+default_base_moof", 0);
+-	ret = avformat_write_header(ctx->oc, &opt);
+-	if (ret < 0)
+-		log_warn("Video: failed to write header!");
+-	av_dict_free(&opt);
+-
+ 	if (av_pix_fmt_desc_get(ctx->c->pix_fmt)->flags & AV_PIX_FMT_FLAG_HWACCEL &&
+ 		ctx->c->hw_frames_ctx)
+ 	{
+@@ -829,12 +805,8 @@ void destroy_video_encoder(VideoContext* ctx)
+ {
+ 	if (ctx->initialized)
+ 	{
+-		av_write_trailer(ctx->oc);
+-		avio_context_free(&ctx->oc->pb);
+-		avformat_free_context(ctx->oc);
+ 		avcodec_free_context(&ctx->c);
+ 		av_packet_free(&ctx->pkt);
+-		av_free(ctx->buf);
+ 		destroy_scalers(&ctx->scalers);
+ 	}
+ 	if (ctx->hw_device_ctx)
+@@ -842,7 +814,11 @@ void destroy_video_encoder(VideoContext* ctx)
+ 	free(ctx);
+ }
+ 
+-void encode_video_frame(VideoContext* ctx, int millis, Error* err)
++// capture_us is when the screen grab behind this frame was taken, on the
++// monotonic clock the Rust side owns; it is passed through to the packet. The
++// encoder runs with no lookahead and no B-frames, so a frame's packet comes out
++// of the same call that put the frame in and the two cannot be paired wrongly.
++void encode_video_frame(VideoContext* ctx, int millis, uint64_t capture_us, Error* err)
+ {
+ 	int ret;
+ 	AVFrame* frame = ctx->frame;
+@@ -865,12 +841,13 @@ void encode_video_frame(VideoContext* ctx, int millis, Error* err)
+ 			ERROR(err, 1, "Error during encoding");
+ 		}
+ 
+-		av_packet_rescale_ts(ctx->pkt, ctx->c->time_base, ctx->st->time_base);
+-		av_write_frame(ctx->oc, ctx->pkt);
++		write_video_packet(
++			ctx->rust_ctx,
++			ctx->pkt->data,
++			ctx->pkt->size,
++			capture_us,
++			(ctx->pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0);
+ 		av_packet_unref(ctx->pkt);
+-
+-		// new fragment on every frame for lowest latency
+-		av_write_frame(ctx->oc, NULL);
+ 	}
+ }
+ 
+diff --git a/src/video.rs b/src/video.rs
+index 984ded9..1ee4b91 100644
+--- a/src/video.rs
++++ b/src/video.rs
+@@ -1,10 +1,26 @@
+ use std::os::raw::{c_int, c_uchar, c_void};
++use std::sync::LazyLock;
+ use std::time::Instant;
+ 
+ use tracing::warn;
+ 
+ use crate::cerror::CError;
+ 
++/// Length of the header prepended to every encoded frame: one flags byte, then
++/// the capture timestamp as a little-endian u64 of microseconds.
++const HEADER_LEN: usize = 9;
++
++/// Flags bit 0: the frame that follows begins with an IDR. The client cannot
++/// decode anything before the first one.
++const FLAG_KEYFRAME: u8 = 1;
++
++/// Epoch of the capture timestamps on the wire: the first frame this process
++/// encodes. `Instant` is monotonic, so the timestamps never run backwards, and
++/// unlike the encoder's own start time this one survives the encoder being torn
++/// down and rebuilt when the capture size changes. There is no way to convert
++/// it to a client's clock; the client measures the offset against its own.
++static CAPTURE_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
++
+ extern "C" {
+     fn init_video_encoder(
+         rust_ctx: *mut c_void,
+@@ -19,21 +35,43 @@ extern "C" {
+     ) -> *mut c_void;
+     fn open_video(handle: *mut c_void, err: *mut CError);
+     fn destroy_video_encoder(handle: *mut c_void);
+-    fn encode_video_frame(handle: *mut c_void, micros: c_int, err: *mut CError);
++    fn encode_video_frame(
++        handle: *mut c_void,
++        millis: c_int,
++        capture_us: u64,
++        err: *mut CError,
++    );
+ 
+     fn fill_rgb(ctx: *mut c_void, data: *const u8, err: *mut CError);
+     fn fill_rgb0(ctx: *mut c_void, data: *const u8, err: *mut CError);
+     fn fill_bgr0(ctx: *mut c_void, data: *const u8, stride: c_int, err: *mut CError);
+ }
+ 
+-// this is used as callback in lib/encode_video.c via ffmpegs AVIOContext
++/// Called from `encode_video_frame` in lib/encode_video.c once per encoded
++/// frame, with that frame's H.264 Annex-B bytes. Prepends the wire header and
++/// hands the result to the sender as a single websocket message.
+ #[no_mangle]
+-fn write_video_packet(video_encoder: *mut c_void, buf: *const c_uchar, buf_size: c_int) -> c_int {
++extern "C" fn write_video_packet(
++    video_encoder: *mut c_void,
++    buf: *const c_uchar,
++    buf_size: c_int,
++    capture_us: u64,
++    is_keyframe: c_int,
++) {
+     let video_encoder = unsafe { (video_encoder as *mut VideoEncoder).as_mut().unwrap() };
+-    (video_encoder.write_data)(unsafe {
+-        std::slice::from_raw_parts(buf as *const u8, buf_size as usize)
+-    });
+-    0
++    let frame = unsafe { std::slice::from_raw_parts(buf as *const u8, buf_size as usize) };
++
++    let VideoEncoder {
++        write_data,
++        message,
++        ..
++    } = video_encoder;
++    message.clear();
++    message.reserve(HEADER_LEN + frame.len());
++    message.push(if is_keyframe != 0 { FLAG_KEYFRAME } else { 0 });
++    message.extend_from_slice(&capture_us.to_le_bytes());
++    message.extend_from_slice(frame);
++    write_data(message);
+ }
+ 
+ pub enum PixelProvider<'a> {
+@@ -72,6 +110,8 @@ pub struct VideoEncoder {
+     height_out: usize,
+     write_data: Box<dyn FnMut(&[u8])>,
+     start_time: Instant,
++    // header plus frame, reused so that encoding a frame does not allocate
++    message: Vec<u8>,
+ }
+ 
+ impl VideoEncoder {
+@@ -91,6 +131,7 @@ impl VideoEncoder {
+             height_out,
+             write_data: Box::new(move |data| write_data(data)),
+             start_time: Instant::now(),
++            message: Vec::new(),
+         });
+         let handle = unsafe {
+             init_video_encoder(
+@@ -116,6 +157,10 @@ impl VideoEncoder {
+     }
+ 
+     pub fn encode(&mut self, pixel_provider: PixelProvider) {
++        // The caller has just grabbed these pixels off the screen; scaling and
++        // encoding are still ahead. This is the closest the encoder gets to the
++        // moment of capture.
++        let capture_us = CAPTURE_EPOCH.elapsed().as_micros() as u64;
+         let mut err = CError::new();
+         match pixel_provider {
+             PixelProvider::BGR0(w, _, bgr0) => unsafe {
+@@ -139,6 +184,7 @@ impl VideoEncoder {
+             encode_video_frame(
+                 self.handle,
+                 (Instant::now() - self.start_time).as_millis() as c_int,
++                capture_us,
+                 &mut err,
+             );
+         }
 diff --git a/ts/lib.ts b/ts/lib.ts
-index cf3944e..3ac44c5 100644
+index 7db2a6d..cce0503 100644
 --- a/ts/lib.ts
 +++ b/ts/lib.ts
 @@ -1,5 +1,9 @@
@@ -13,25 +309,16 @@ index cf3944e..3ac44c5 100644
  }
  
  enum LogLevel {
-@@ -15,6 +19,9 @@ let log_level: LogLevel = LogLevel.ERROR;
+@@ -15,6 +19,8 @@ let log_level: LogLevel = LogLevel.ERROR;
  let no_log_messages: boolean = true;
  
  let fps_out: HTMLOutputElement;
-+let round_trip_out: HTMLOutputElement;
 +// frames actually painted since the last readout, not messages received: a
 +// stalled decoder used to be invisible because the messages kept arriving
  let frame_count = 0;
  let last_fps_calc: number = performance.now();
  
-@@ -26,6 +33,7 @@ function run(level: string) {
-         log_pre.textContent = "";
-         log_level = LogLevel[level];
-         fps_out = document.getElementById("fps") as HTMLOutputElement;
-+        round_trip_out = document.getElementById("round_trip") as HTMLOutputElement;
-         check_video = document.getElementById("enable_video") as HTMLInputElement;
-         window.addEventListener("error", (e: ErrorEvent | Event | UIEvent) => {
-             if ((e as ErrorEvent).error) {
-@@ -34,10 +42,7 @@ function run(level: string) {
+@@ -34,10 +40,7 @@ function run(level: string) {
              } else if ((e as Event | UIEvent).target) {
                  let ev = e as Event;
                  let src = (e.target as any).src;
@@ -43,38 +330,15 @@ index cf3944e..3ac44c5 100644
              } else {
                  log(LogLevel.WARN, "Got unknown event: " + JSON.stringify(e));
              }
-@@ -116,11 +121,10 @@ class Settings {
+@@ -116,7 +119,6 @@ class Settings {
      scale_video_input: HTMLInputElement;
      scale_video_output: HTMLOutputElement;
      range_min_pressure: HTMLInputElement;
--    ink_latency_input: HTMLInputElement;
-+    ink_hold_input: HTMLInputElement;
-     ink_thickness_input: HTMLInputElement;
-     ink_color_input: HTMLInputElement;
-     ink_mode_output: HTMLOutputElement;
 -    check_aggressive_seek: HTMLInputElement;
      client_name_input: HTMLInputElement;
      visible: boolean;
      custom_input_areas: CustomInputAreas;
-@@ -137,7 +141,7 @@ class Settings {
-         this.scale_video_input = document.getElementById("scale_video") as HTMLInputElement;
-         this.scale_video_output = this.scale_video_input.nextElementSibling as HTMLOutputElement;
-         this.range_min_pressure = document.getElementById("min_pressure") as HTMLInputElement;
--        this.ink_latency_input = document.getElementById("ink_latency") as HTMLInputElement;
-+        this.ink_hold_input = document.getElementById("ink_hold") as HTMLInputElement;
-         this.ink_thickness_input = document.getElementById("ink_thickness") as HTMLInputElement;
-         this.ink_color_input = document.getElementById("ink_color") as HTMLInputElement;
-         this.ink_mode_output = document.getElementById("ink_mode") as HTMLOutputElement;
-@@ -149,7 +153,7 @@ class Settings {
-             let [w, h] = calc_max_video_resolution(this.scale_video_input.valueAsNumber)
-             this.scale_video_output.value = w + "x" + h
-         }
--        for (const input of [this.ink_latency_input, this.ink_thickness_input]) {
-+        for (const input of [this.ink_hold_input, this.ink_thickness_input]) {
-             input.oninput = () => {
-                 (input.nextElementSibling as HTMLOutputElement).value = input.value;
-             }
-@@ -199,14 +203,9 @@ class Settings {
+@@ -186,14 +188,9 @@ class Settings {
              this.save_settings();
          };
  
@@ -90,42 +354,7 @@ index cf3944e..3ac44c5 100644
              document.getElementById("canvas").classList.toggle("vanish", enabled);
              this.save_settings();
              if (enabled) {
-@@ -236,7 +235,7 @@ class Settings {
-         this.frame_rate_input.onchange = () => this.save_settings();
-         this.range_min_pressure.onchange = () => this.save_settings();
-         this.checks.get("local_ink").onchange = () => this.save_settings();
--        this.ink_latency_input.onchange = () => this.save_settings();
-+        this.ink_hold_input.onchange = () => this.save_settings();
-         this.ink_thickness_input.onchange = () => this.save_settings();
-         this.ink_color_input.onchange = () => this.save_settings();
- 
-@@ -278,7 +277,7 @@ class Settings {
-         settings["frame_rate"] = frame_rate_scale(this.frame_rate_input.valueAsNumber).toString();
-         settings["scale_video"] = this.scale_video_input.value;
-         settings["min_pressure"] = this.range_min_pressure.value;
--        settings["ink_latency"] = this.ink_latency_input.value;
-+        settings["ink_hold"] = this.ink_hold_input.value;
-         settings["ink_thickness"] = this.ink_thickness_input.value;
-         settings["ink_color"] = this.ink_color_input.value;
-         settings["custom_input_areas"] = this.custom_input_areas;
-@@ -319,14 +318,14 @@ class Settings {
-                 this.range_min_pressure.value = min_pressure;
- 
-             for (const [key, input] of [
--                ["ink_latency", this.ink_latency_input],
-+                ["ink_hold", this.ink_hold_input],
-                 ["ink_thickness", this.ink_thickness_input],
-                 ["ink_color", this.ink_color_input],
-             ] as [string, HTMLInputElement][]) {
-                 if (settings[key])
-                     input.value = settings[key];
-             }
--            for (const input of [this.ink_latency_input, this.ink_thickness_input])
-+            for (const input of [this.ink_hold_input, this.ink_thickness_input])
-                 (input.nextElementSibling as HTMLOutputElement).value = input.value;
- 
-             this.custom_input_areas = settings["custom_input_areas"];
-@@ -339,7 +338,7 @@ class Settings {
+@@ -308,7 +305,7 @@ class Settings {
                  this.checks.get("enable_video").checked = false;
                  if (this.checks.get("energysaving").checked)
                      this.checks.get("enable_video").disabled = true;
@@ -134,172 +363,15 @@ index cf3944e..3ac44c5 100644
                  document.getElementById("canvas").classList.remove("vanish");
              }
  
-@@ -441,6 +440,7 @@ class Settings {
+@@ -400,6 +397,7 @@ class Settings {
+ }
  
  let settings: Settings;
- let ink_overlay: InkOverlay;
 +let video_clock: VideoClock;
  let debug_overlay: HTMLElement;
  let last_pointer_data: Object;
  
-@@ -742,6 +742,14 @@ const XPP_NO_PRESSURE = -1;                 // Point::NO_PRESSURE
- // Full scale of the uinput absolute axes the pen events are sent on.
- const WIRE_ABS_MAX = 65535;
- 
-+/* Fallback for the Echo hold slider, in milliseconds; keep it in step with the
-+ * slider's own default. InkOverlay.cutoff says what the hold covers. */
-+const INK_HOLD_DEFAULT = 60;
-+
-+/* Longest a finished stroke goes on being echoed when frames have stopped
-+ * arriving and so nothing can retire it. */
-+const INK_MAX_HOLD = 5000;
-+
- class InkPoint {
-     // document units (PostScript points), the space Stroke::points lives in
-     x: number;
-@@ -749,7 +757,8 @@ class InkPoint {
-     // stroke diameter at this point, in document units; -1 means "no pressure"
-     z: number;
-     // timestamp of the event that produced the point, on performance.now()'s
--    // clock, so the trailing window can find the part not yet on the video
-+    // clock, so the point can be dropped once a frame proves the video is
-+    // showing it
-     t: number;
- }
- 
-@@ -797,11 +806,19 @@ class ToolState {
-  * rasterised (the union of one capsule per segment, filled once). Everything
-  * runs in document units; only the final transform maps them to the screen.
-  *
-- * Only the last "Latency window" milliseconds of a stroke are drawn. The older
-- * part has already come back on the video, and drawing over it reads as bolder
-- * ink however exact the geometry is: the video's copy has been through a lossy
-- * encoder and the canvas's has not, and two translucent highlighter passes
-- * genuinely do multiply.
-+ * Only the part of a stroke the video has not caught up with yet is drawn.
-+ * Drawing over ink the video has already delivered reads as bolder however
-+ * exact the geometry is: the video's copy has been through a lossy encoder and
-+ * the canvas's has not, and two translucent highlighter passes genuinely do
-+ * multiply.
-+ *
-+ * Which part that is comes from the frames themselves rather than from a fixed
-+ * window into the past. Every frame carries the instant it was captured, so a
-+ * point is retired only once a frame captured after the server could have drawn
-+ * it has actually been painted. When the video stalls the cutoff stalls with
-+ * it and the whole stroke keeps being echoed, which is the behaviour a fixed
-+ * window cannot have: it retires ink on schedule whether or not the video
-+ * arrived, and the missing ink shows as a gap behind the pen.
-  *
-  * The echo is dropped outright at pen-up rather than fading: Xournal++'s shape
-  * recognizer can replace the finished stroke with something else entirely, so
-@@ -820,6 +837,9 @@ class InkOverlay {
-     rect_y: number;
-     rect_w: number;
-     rect_h: number;
-+    // capture instant of the newest painted frame, on performance.now()'s
-+    // clock; -Infinity until a frame has been painted, which retires nothing
-+    last_frame_at: number;
- 
-     constructor(canvas: HTMLCanvasElement) {
-         this.canvas = canvas;
-@@ -834,6 +854,7 @@ class InkOverlay {
-         this.rect_y = 0;
-         this.rect_w = 0;
-         this.rect_h = 0;
-+        this.last_frame_at = -Infinity;
-         this.resize();
-         window.addEventListener("resize", () => this.resize());
-         requestAnimationFrame(() => this.render());
-@@ -861,6 +882,40 @@ class InkOverlay {
-         this.update_mode();
-     }
- 
-+    /* A frame has just been painted; capture_ms is when the server grabbed it,
-+     * on the server's clock. Frames can only move the cutoff forwards: a decoder
-+     * that hands back an out-of-order frame must not un-retire ink. */
-+    on_frame(capture_ms: number) {
-+        let offset = video_clock.offset();
-+        if (offset === null)
-+            return;
-+        this.last_frame_at = Math.max(this.last_frame_at, capture_ms + offset);
-+    }
-+
-+    /* Input older than this is on the video already and is no longer echoed.
-+     *
-+     * The frame shows every input the server had finished drawing when it was
-+     * captured, so the cutoff is the frame's capture instant less everything
-+     * that stands between an event leaving this page and its ink being on the
-+     * server's screen: the trip up the websocket, the input injection, and
-+     * Xournal++'s redraw. That is what the Echo hold slider is; it also absorbs
-+     * the error in the clock estimate, which leans the same way. */
-+    private cutoff(): number {
-+        let hold = settings.ink_hold_input.valueAsNumber;
-+        if (!isFinite(hold))
-+            hold = INK_HOLD_DEFAULT;
-+        return this.last_frame_at - hold;
-+    }
-+
-+    /* Age of the newest input the video is believed to be showing: the whole
-+     * loop out to the server and back, as far as this page can measure it.
-+     * "-" until a frame has been painted. */
-+    round_trip(now: number): string {
-+        if (!isFinite(this.last_frame_at))
-+            return "-";
-+        return Math.round(now - this.cutoff()).toString();
-+    }
-+
-     live(): boolean {
-         return this.tool_state != null && this.capture_width > 0 && this.capture_height > 0;
-     }
-@@ -1199,7 +1254,7 @@ class InkOverlay {
-      * subpath's start, so starting at the centre cuts a wedge out of the
-      * capsule.
-      *
--     * `from` is the trailing window's first point. Windowing cannot disturb the
-+     * `from` is the first point not yet retired. Retiring cannot disturb the
-      * widths: segment i takes its radius from pts[i], so dropping a prefix
-      * leaves every surviving segment on the width it already had. */
-     private static contour(pts: InkPoint[], from: number): Path2D {
-@@ -1232,12 +1287,16 @@ class InkOverlay {
- 
-     render() {
-         requestAnimationFrame(() => this.render());
--        let latency = settings.ink_latency_input.valueAsNumber;
--        if (!isFinite(latency))
--            latency = 90;
-         let now = performance.now();
--        if (this.strokes.some((s) => s.done_at != 0 && now - s.done_at > latency))
--            this.strokes = this.strokes.filter((s) => s.done_at == 0 || now - s.done_at <= latency);
-+        let cutoff = this.cutoff();
-+        /* A finished stroke is kept until the video has caught up with its last
-+         * point, however long that takes. The cap only bites if frames stop
-+         * arriving altogether, and then holding on to strokes forever would be
-+         * a leak on top of an already broken picture. */
-+        let live = (s: InkStroke) => s.done_at == 0
-+            || (s.points[s.points.length - 1].t >= cutoff && now - s.done_at <= INK_MAX_HOLD);
-+        if (!this.strokes.every(live))
-+            this.strokes = this.strokes.filter(live);
- 
-         let ctx = this.ctx;
-         if (!this.enabled() || this.strokes.length == 0 || this.rect_w <= 0 || this.rect_h <= 0) {
-@@ -1252,7 +1311,6 @@ class InkOverlay {
-         ctx.setTransform(1, 0, 0, 1, 0, 0);
-         ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-         let dpr = window.devicePixelRatio;
--        let cutoff = now - latency;
-         let drew = false;
-         for (const s of this.strokes) {
-             let pts = s.points;
-@@ -1260,7 +1318,7 @@ class InkOverlay {
-             if (n == 0 || pts[n - 1].t < cutoff)
-                 continue;                   // the video already has all of it
-             // Segment i is still ours while its far end is newer than the
--            // cutoff, so the window starts one point before the first such
-+            // cutoff, so the echo starts one point before the first such
-             // segment and stays attached to the ink already on the video.
-             let from = 0;
-             while (from + 1 < n && pts[from + 1].t < cutoff)
-@@ -1312,7 +1370,7 @@ class PointerHandler {
+@@ -691,7 +689,7 @@ class PointerHandler {
      pointerTypes: string[];
  
      constructor(webSocket: WebSocket) {
@@ -308,12 +380,7 @@ index cf3944e..3ac44c5 100644
          let canvas = document.getElementById("canvas");
          this.webSocket = webSocket;
          this.pointerTypes = settings.pointer_types();
-@@ -1523,64 +1581,250 @@ function frame_rate_stats() {
-     fps_out.value = fps.toString();
-     frame_count = 0;
-     last_fps_calc = t;
-+    if (ink_overlay)
-+        round_trip_out.value = ink_overlay.round_trip(t);
+@@ -950,61 +948,241 @@ function frame_rate_stats() {
      setTimeout(() => frame_rate_stats(), 1500);
  }
  
@@ -487,10 +554,6 @@ index cf3944e..3ac44c5 100644
 +            }
 +            this.ctx.drawImage(frame, 0, 0);
 +            frame_count += 1;
-+            // The decoder carries the chunk's timestamp through to the frame,
-+            // so this is the instant the server grabbed these very pixels.
-+            if (ink_overlay)
-+                ink_overlay.on_frame(frame.timestamp / 1000);
 +        } finally {
 +            frame.close();
 +        }
@@ -603,7 +666,7 @@ index cf3944e..3ac44c5 100644
                  } else if (msg == "ConfigOk") {
                      onConfigOk();
                  }
-@@ -1608,31 +1852,15 @@ function handle_messages(
+@@ -1026,31 +1204,15 @@ function handle_messages(
          }
  
          // not a string -> got a video frame
@@ -638,7 +701,7 @@ index cf3944e..3ac44c5 100644
          },
          {
              attrs: ["PointerEvent"],
-@@ -1664,9 +1892,11 @@ function init() {
+@@ -1082,8 +1244,10 @@ function init() {
      debug_overlay = document.getElementById("debug_overlay");
      settings = new Settings(webSocket);
  
@@ -646,12 +709,11 @@ index cf3944e..3ac44c5 100644
 +    let video = document.getElementById("video_canvas") as HTMLCanvasElement;
      let canvas = document.getElementById("canvas") as HTMLCanvasElement;
 +    video_clock = new VideoClock();
-     ink_overlay = new InkOverlay(document.getElementById("ink_canvas") as HTMLCanvasElement);
 +    let stream = new VideoStream(video, webSocket);
  
      video.oncontextmenu = function(event) {
          event.preventDefault();
-@@ -1712,11 +1942,8 @@ function init() {
+@@ -1129,11 +1293,8 @@ function init() {
          settings.scale_video_output.value = w + "x" + h;
          settings.send_server_config();
      }
@@ -664,7 +726,7 @@ index cf3944e..3ac44c5 100644
          if (!is_connected) {
              new KeyboardHandler(webSocket);
              new PointerHandler(webSocket);
-@@ -1748,7 +1975,7 @@ function init() {
+@@ -1165,7 +1326,7 @@ function init() {
  // object-fit: fill; <-- this is unfortunately not supported on iOS, so we use the following
  // workaround
  function stretch_video() {
@@ -674,7 +736,7 @@ index cf3944e..3ac44c5 100644
          video.style.transform = "scaleX(" + document.body.clientWidth / video.clientWidth + ") scaleY(" + document.body.clientHeight / video.clientHeight + ")";
      } else {
 diff --git a/www/static/style.css b/www/static/style.css
-index fc4bb01..05f523e 100644
+index 41d48cb..536d801 100644
 --- a/www/static/style.css
 +++ b/www/static/style.css
 @@ -31,7 +31,16 @@ body, html, main {
@@ -695,7 +757,7 @@ index fc4bb01..05f523e 100644
      max-width: 100%;
      max-height: 100%;
      width: auto;
-@@ -39,11 +48,6 @@ video {
+@@ -39,10 +48,6 @@ video {
      display: block;
      margin: auto auto;
  }
@@ -703,11 +765,10 @@ index fc4bb01..05f523e 100644
 -    position: absolute;
 -    width: 100%;
 -    height: 100%;
--}
- #ink_canvas {
-     top: 0;
-     left: 0;
-@@ -116,7 +120,7 @@ input[type='range']::-webkit-slider-runnable-track, input[type="range"]::-moz-ra
+ }
+ input[type='text'] {
+     touch-action: auto !important;
+@@ -111,7 +116,7 @@ input[type='range']::-webkit-slider-runnable-track, input[type="range"]::-moz-ra
      right: -1em;
      border-radius: 0 0 0.25em 0;
  }
@@ -717,7 +778,7 @@ index fc4bb01..05f523e 100644
  }
  #settings h2 {
 diff --git a/www/templates/index.html b/www/templates/index.html
-index 1bcf3ea..6849e82 100644
+index 17ab93a..bdf0c0b 100644
 --- a/www/templates/index.html
 +++ b/www/templates/index.html
 @@ -16,7 +16,7 @@
@@ -727,9 +788,9 @@ index 1bcf3ea..6849e82 100644
 -        <video id="video" autoplay muted defaultMuted playsinline disablePictureInPicture></video>
 +        <canvas id="video_canvas" width="16" height="9"></canvas>
          <canvas id="canvas" class="vanish"></canvas>
-         <canvas id="ink_canvas"></canvas>
          <div id="debug_overlay" class="hide"></div>
-@@ -41,8 +41,6 @@
+     </main>
+@@ -40,8 +40,6 @@
                      <input type="checkbox" id="capture_cursor" />
                      <span>Capture Cursor</span>
                  </label>
@@ -738,24 +799,12 @@ index 1bcf3ea..6849e82 100644
                  <label>Max Video Resolution: <br><input type="range" id="scale_video" min="0.1" max="2" step="0.01"
                          value="1.8" /><output></output></label>
                  <label>Frame Rate: <br><input type="range" id="frame_rate" value="0" /><output>30</output> fps</label>
-@@ -68,8 +66,8 @@
-             <section>
-                 <label><input type="checkbox" id="local_ink" checked /> <span>Local Ink</span></label>
-                 <label>Mode: <output id="ink_mode">manual</output></label>
--                <label>Latency window: <br><input type="range" id="ink_latency" min="0" max="300" step="10"
--                        value="90" /><output>90</output> ms</label>
-+                <label>Echo hold: <br><input type="range" id="ink_hold" min="0" max="200" step="5"
-+                        value="60" /><output>60</output> ms</label>
-                 <label>Thickness: <br><input type="range" id="ink_thickness" min="0.5" max="12" step="0.5"
-                         value="3" /><output>3</output> px</label>
-                 <label>Color: <input type="color" id="ink_color" value="#000000" /></label>
-@@ -83,7 +81,8 @@
+@@ -72,7 +70,7 @@
                  <label id="vanish">Hide until Reload</label>
              </section>
              <section id="stats_section">
 -                <label><span>FPS (receiving): </span><output id="fps">0</output></label>
 +                <label><span>FPS (painted): </span><output id="fps">0</output></label>
-+                <label><span>Round trip: </span><output id="round_trip">-</output> ms</label>
              </section>
              <section id="debug_section">
                  <label><input type="checkbox" id="enable_debug_overlay" /> <span>Debug

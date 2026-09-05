@@ -1,8 +1,16 @@
+Give the stylus and mouse screen-mapping retries their own counters.
+
+All three pointer branches incremented num_touch_mapping_tries. The stylus and
+mouse guards therefore never tripped, so every pointer event remapped the
+device to the screen: two blocking X round trips against the same display lock
+the screen capture holds. The touch guard meanwhile ran out three times too
+early. Upstream bug.
+
 diff --git a/src/input/uinput_device.rs b/src/input/uinput_device.rs
-index d849b4a..dceb3c7 100644
+index e1b942d..e7cf38d 100644
 --- a/src/input/uinput_device.rs
 +++ b/src/input/uinput_device.rs
-@@ -504,7 +504,7 @@ impl InputDevice for UInputDevice {
+@@ -514,7 +514,7 @@ impl InputDevice for UInputDevice {
                                  .map_input_device_to_entire_screen(&self.name_stylus_device, true);
                          }
                      }
@@ -11,7 +19,7 @@ index d849b4a..dceb3c7 100644
                  }
                  match event.event_type {
                      PointerEventType::DOWN
-@@ -597,7 +597,7 @@ impl InputDevice for UInputDevice {
+@@ -607,7 +607,7 @@ impl InputDevice for UInputDevice {
                                  .map_input_device_to_entire_screen(&self.name_mouse_device, false);
                          }
                      }

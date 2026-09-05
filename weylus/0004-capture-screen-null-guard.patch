@@ -1,0 +1,23 @@
+Check _NET_ACTIVE_WINDOW before dereferencing it.
+
+get_property returns NULL both when XGetWindowProperty fails and when the
+property is absent, and the next line dereferences it on every captured frame.
+It survives only because the window manager sets the property. free(NULL)
+further down is already safe, and for the Desktop capturable both branches do
+the same XShmGetImage on the root, so falling to the else branch on NULL
+captures the same picture. Upstream bug.
+
+diff --git a/lib/linux/xcapture.c b/lib/linux/xcapture.c
+index 743021e..125f1a7 100644
+--- a/lib/linux/xcapture.c
++++ b/lib/linux/xcapture.c
+@@ -167,7 +167,8 @@ void capture_screen(CaptureContext* ctx, struct Image* img, int capture_cursor,
+ 
+ 		active_window =
+ 			(Window*)get_property(ctx->cap.disp, root, XA_WINDOW, "_NET_ACTIVE_WINDOW", &size, err);
+-		if (!ctx->wayland && *active_window == ctx->cap.c.winfo.win && !is_offscreen)
++		if (!ctx->wayland && active_window && *active_window == ctx->cap.c.winfo.win &&
++			!is_offscreen)
+ 		{
+ 			// cap window within its root so menus are visible as strictly speaking menus do not
+ 			// belong to the window itself ...

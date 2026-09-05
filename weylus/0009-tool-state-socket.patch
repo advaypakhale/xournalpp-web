@@ -1,0 +1,184 @@
+Relay a unix socket to connected clients, and tell them the capture size.
+
+--tool-state-socket connects to a socket and forwards each newline-delimited
+message to the client verbatim, retrying while the socket does not exist and
+reconnecting when the peer goes away. Weylus does not interpret the payload.
+
+Clients also get the size of the capture, which the encoded video may be
+smaller than, so they can map remote pixels to display pixels.
+
+diff --git a/src/config.rs b/src/config.rs
+index 27922e8..98b0028 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -121,6 +121,14 @@ pub struct Config {
+     )]
+     #[serde(default)]
+     pub precreate_uinput: bool,
++    #[cfg(target_os = "linux")]
++    #[arg(
++        long,
++        help = "Connect to this unix socket and forward each newline-delimited \
++                message read from it verbatim to connected clients."
++    )]
++    #[serde(default)]
++    pub tool_state_socket: Option<PathBuf>,
+ 
+     #[arg(long, help = "Print template of index.html served by Weylus.")]
+     #[serde(skip)]
+diff --git a/src/protocol.rs b/src/protocol.rs
+index 0507e93..90f4b1a 100644
+--- a/src/protocol.rs
++++ b/src/protocol.rs
+@@ -33,6 +33,12 @@ pub enum MessageOutbound {
+     CustomInputAreas(CustomInputAreas),
+     ConfigError(String),
+     Error(String),
++    /// Raw line relayed from the tool-state socket; Weylus does not interpret
++    /// it.
++    ToolState(String),
++    /// Size of the captured screen in pixels, before any downscaling for
++    /// encoding.
++    CaptureSize { width: usize, height: usize },
+ }
+ 
+ #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+diff --git a/src/web.rs b/src/web.rs
+index 783ff7c..7761ceb 100644
+--- a/src/web.rs
++++ b/src/web.rs
+@@ -169,6 +169,13 @@ async fn serve(
+                     Ok(ws) => {
+                         let (sender, receiver) =
+                             weylus_websocket_channel(ws, semaphore_websocket_shutdown);
++                        #[cfg(target_os = "linux")]
++                        if let Some(path) = config.tool_state_socket.clone() {
++                            let sender = sender.clone();
++                            std::thread::spawn(move || {
++                                crate::websocket::relay_tool_state(path, sender)
++                            });
++                        }
+                         std::thread::spawn(move || {
+                             let client = WeylusClientHandler::new(
+                                 sender,
+diff --git a/src/websocket.rs b/src/websocket.rs
+index 40953ea..01f9af6 100644
+--- a/src/websocket.rs
++++ b/src/websocket.rs
+@@ -64,6 +64,8 @@ pub struct WeylusClientConfig {
+     pub wayland_support: bool,
+     #[cfg(target_os = "linux")]
+     pub shared_uinput: Option<Arc<Mutex<crate::input::uinput_device::UInputDevice>>>,
++    #[cfg(target_os = "linux")]
++    pub tool_state_socket: Option<std::path::PathBuf>,
+     pub no_gui: bool,
+ }
+ 
+@@ -428,6 +430,16 @@ fn handle_video<S: WeylusSender + Clone + 'static>(
+                         .unwrap()
+                         .check_size(width_in, height_in, width_out, height_out)
+                 {
++                    // The encoded video may be smaller than the capture; the
++                    // client needs the capture size to map remote pixels to
++                    // display pixels.
++                    send_message(
++                        &mut sender,
++                        MessageOutbound::CaptureSize {
++                            width: width_in,
++                            height: height_in,
++                        },
++                    );
+                     send_message(&mut sender, MessageOutbound::NewVideo);
+                     let mut sender = sender.clone();
+                     let res = VideoEncoder::new(
+@@ -501,6 +513,77 @@ impl WeylusSender for WsWeylusSender {
+     }
+ }
+ 
++/// Forwards newline-delimited messages from a unix socket to one websocket
++/// client. Retries with backoff while the socket does not exist and reconnects
++/// when the peer goes away; exits once the websocket client is gone. Knows
++/// nothing about the payload.
++#[cfg(target_os = "linux")]
++pub fn relay_tool_state(path: std::path::PathBuf, sender: WsWeylusSender) {
++    use std::io::{BufRead, BufReader, ErrorKind};
++    use std::os::unix::net::UnixStream;
++
++    const BACKOFF_START: Duration = Duration::from_millis(250);
++    const BACKOFF_MAX: Duration = Duration::from_secs(2);
++
++    let mut backoff = BACKOFF_START;
++    'reconnect: loop {
++        if sender.sender.is_closed() {
++            return;
++        }
++        let stream = match UnixStream::connect(&path) {
++            Ok(stream) => stream,
++            Err(_) => {
++                std::thread::sleep(backoff);
++                backoff = (backoff * 2).min(BACKOFF_MAX);
++                continue;
++            }
++        };
++        backoff = BACKOFF_START;
++        // A finite read timeout lets the loop notice a vanished websocket
++        // client even while the tool state is silent.
++        if stream
++            .set_read_timeout(Some(Duration::from_secs(2)))
++            .is_err()
++        {
++            continue;
++        }
++        let mut reader = BufReader::new(stream);
++        let mut line = String::new();
++        loop {
++            if sender.sender.is_closed() {
++                return;
++            }
++            match reader.read_line(&mut line) {
++                Ok(0) => continue 'reconnect,
++                Ok(_) => {
++                    let msg = line.trim_end().to_string();
++                    line.clear();
++                    if !msg.is_empty()
++                        && sender
++                            .sender
++                            .blocking_send(WsMessage::MessageOutbound(MessageOutbound::ToolState(
++                                msg,
++                            )))
++                            .is_err()
++                    {
++                        return;
++                    }
++                }
++                // partial data before the timeout stays in `line`
++                Err(err)
++                    if matches!(
++                        err.kind(),
++                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
++                    ) =>
++                {
++                    continue
++                }
++                Err(_) => continue 'reconnect,
++            }
++        }
++    }
++}
++
+ pub fn weylus_websocket_channel(
+     websocket: WebSocket<TokioIo<Upgraded>>,
+     semaphore_shutdown: Arc<tokio::sync::Semaphore>,
+diff --git a/src/weylus.rs b/src/weylus.rs
+index c230f57..ad96992 100644
+--- a/src/weylus.rs
++++ b/src/weylus.rs
+@@ -85,6 +85,8 @@ impl Weylus {
+                 wayland_support: config.wayland_support,
+                 #[cfg(target_os = "linux")]
+                 shared_uinput,
++                #[cfg(target_os = "linux")]
++                tool_state_socket: config.tool_state_socket.clone(),
+                 no_gui: config.no_gui,
+             },
+         );
