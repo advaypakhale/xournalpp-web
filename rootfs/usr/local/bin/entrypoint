@@ -26,10 +26,9 @@ cleanup() {
 trap cleanup TERM INT
 
 # Killing the container leaves an emergency save behind, and Xournal++ then
-# offers to restore it in a modal dialog. That dialog takes the keyboard, so no
-# shortcut works until it is answered, and dialogs do not appear in the video
-# stream, so it cannot be answered. Keep the file as an ordinary document
-# instead, where it can be opened normally.
+# offers to restore it in a modal dialog that holds the keyboard until it is
+# answered. Keep the file as an ordinary document instead, so every restart
+# comes up ready to draw on.
 emergency="$XDG_CONFIG_HOME/xournalpp/emergencysave.xopp"
 if [ -e "$emergency" ]; then
     mv "$emergency" "/data/notes/recovered-$(date +%Y%m%d-%H%M%S).xopp"
